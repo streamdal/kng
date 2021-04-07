@@ -38,7 +38,6 @@ type IKafka interface {
 	CreateTopic(ctx context.Context, topic string) error
 }
 
-// This should _probably_ be under IKafka
 type IReader interface {
 	Read(ctx context.Context) (kafka.Message, error)
 }
