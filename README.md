@@ -8,14 +8,20 @@ It wraps both [segmentio/kafka-go](https://github.com/segmentio/kafka-go) and
 [Shopify/sarama](https://github.com/Shopify/sarama) libs for different
 functionality.
 
-## What is `segmentio/kafka-go` used for?
+## Special bits
 
-* Producing
-* Consuming
+The publisher does a lot of stuff under the hood which dramatically improves
+write performance.
 
-## What is `Shopify/sarama` used for?
-
-* Topic management
+* Automatically creates a dedicated publisher for the given topic IF a 
+publisher does not already exist.
+* Starts a background publisher in a goroutine that will clear its queue on
+an interval defined by `PublishInterval`.
+* Publisher goroutine will be stopped if it is idle for longer than 
+`WorkerIdleTimeout`.
+* To avoid kafka from rejecting a batch containing too many messages, the
+publisher will automatically divide the batch into "sub-batches" (whose
+size is defined by `DefaultSubBatchSize`.
 
 ## Why multiple libs?
 
