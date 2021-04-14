@@ -98,6 +98,10 @@ type Options struct {
 	ReaderMaxWait       time.Duration
 	ReaderUseLastOffset bool
 
+	// Producer specific settings
+	NumPartitionsPerTopic int
+	ReplicationFactor int
+
 	// ServiceShutdownContext is used by main() to shutdown services before application termination
 	ServiceShutdownContext context.Context
 
@@ -149,6 +153,14 @@ func New(opts *Options) (*Kafka, error) {
 		ServiceShutdownContext: opts.ServiceShutdownContext,
 		MainShutdownFunc:       opts.MainShutdownFunc,
 		log:                    logrus.WithField("pkg", "kafka"),
+	}
+
+	if k.Options.ReplicationFactor == 0 {
+		k.Options.ReplicationFactor = DefaultReplicationFactor
+	}
+
+	if k.Options.NumPartitionsPerTopic == 0 {
+		k.Options.NumPartitionsPerTopic = DefaultNumPartitionsPerTopic
 	}
 
 	// This goroutine waits for service cancel context to trigger and then loops until all publishers have pushed
@@ -210,13 +222,10 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 		return errors.Wrap(err, "unable to determine brokers")
 	}
 
-	replicationFactor := DefaultReplicationFactor
-	numPartitions := DefaultNumPartitionsPerTopic
-
 	// If local, we do not want to overload kafka - use sensible settings
 	if len(brokers) == 1 {
-		replicationFactor = 1
-		numPartitions = 1
+		k.Options.ReplicationFactor = 1
+		k.Options.NumPartitionsPerTopic = 1
 	}
 
 	broker, err := k.Conn.Controller()
@@ -231,8 +240,8 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 
 	if err := controller.CreateTopics(kafka.TopicConfig{
 		Topic:             topic,
-		NumPartitions:     numPartitions,
-		ReplicationFactor: replicationFactor,
+		NumPartitions:     k.Options.NumPartitionsPerTopic,
+		ReplicationFactor: k.Options.ReplicationFactor,
 	}); err != nil {
 		return errors.Wrap(err, "unable to create topic")
 	}
