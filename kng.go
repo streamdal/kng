@@ -130,11 +130,17 @@ func New(opts *Options) (*Kafka, error) {
 			opts.Brokers[0], err)
 	}
 
+	transport := &kafka.Transport{
+		Dial:        dialer.DialFunc,
+		DialTimeout: opts.Timeout,
+	}
+
 	k := &Kafka{
 		Conn: conn,
 		Writer: &kafka.Writer{
 			Addr:      kafka.TCP(opts.Brokers[0]),
 			BatchSize: opts.BatchSize,
+			Transport: transport,
 		},
 		Dialer:                 dialer,
 		PublisherMutex:         &sync.RWMutex{},
