@@ -100,7 +100,7 @@ type Options struct {
 
 	// Producer specific settings
 	NumPartitionsPerTopic int
-	ReplicationFactor int
+	ReplicationFactor     int
 
 	// ServiceShutdownContext is used by main() to shutdown services before application termination
 	ServiceShutdownContext context.Context
@@ -135,8 +135,9 @@ func New(opts *Options) (*Kafka, error) {
 	}
 
 	transport := &kafka.Transport{
-		Dial:        dialer.DialFunc,
 		DialTimeout: opts.Timeout,
+		// Bug? TLS has to be specified here; TLS on dialer doesn't work.
+		TLS: dialer.TLS,
 	}
 
 	k := &Kafka{
