@@ -128,10 +128,9 @@ func New(opts *Options) (*Kafka, error) {
 
 	ctxWithTimeout, _ := context.WithTimeout(context.Background(), opts.Timeout)
 
-	conn, err := dialer.DialContext(ctxWithTimeout, "tcp", opts.Brokers[0])
+	conn, err := dialKafka(ctxWithTimeout, dialer, opts.Brokers)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create initial connection to broker '%s': %s",
-			opts.Brokers[0], err)
+		return nil, fmt.Errorf("unable to create initial connection to broker(s): %s", err)
 	}
 
 	transport := &kafka.Transport{
@@ -143,7 +142,7 @@ func New(opts *Options) (*Kafka, error) {
 	k := &Kafka{
 		Conn: conn,
 		Writer: &kafka.Writer{
-			Addr:      kafka.TCP(opts.Brokers[0]),
+			Addr:      kafka.TCP(opts.Brokers...),
 			BatchSize: opts.BatchSize,
 			Transport: transport,
 		},
@@ -540,4 +539,17 @@ func (k *Kafka) getPublisherByTopic(topic string) *Publisher {
 	}
 
 	return p
+}
+
+func dialKafka(ctx context.Context, dialer *kafka.Dialer, brokers []string) (*kafka.Conn, error) {
+	for _, addr := range brokers {
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			logrus.Errorf("unable to dial '%s': %s", addr, err)
+		}
+
+		return conn, nil
+	}
+
+	return nil, errors.New("unable to dial kafka broker(s) - broker list exhausted")
 }
