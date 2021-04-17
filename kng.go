@@ -43,7 +43,6 @@ type IReader interface {
 }
 
 type Kafka struct {
-	Conn           *kafka.Conn
 	Dialer         *kafka.Dialer
 	Writer         *kafka.Writer
 	PublisherMap   map[string]*Publisher
@@ -128,7 +127,7 @@ func New(opts *Options) (*Kafka, error) {
 
 	ctxWithTimeout, _ := context.WithTimeout(context.Background(), opts.Timeout)
 
-	conn, err := dialKafka(ctxWithTimeout, dialer, opts.Brokers)
+	_, err := dialKafka(ctxWithTimeout, dialer, opts.Brokers)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create initial connection to broker(s): %s", err)
 	}
@@ -140,7 +139,6 @@ func New(opts *Options) (*Kafka, error) {
 	}
 
 	k := &Kafka{
-		Conn: conn,
 		Writer: &kafka.Writer{
 			Addr:      kafka.TCP(opts.Brokers...),
 			BatchSize: opts.BatchSize,
@@ -217,7 +215,12 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 	defer span.Finish()
 
 	// Figure out number of brokers so we can set appropriate replication factor
-	brokers, err := k.Conn.Brokers()
+	conn, err := dialKafka(ctx, k.Dialer, k.Options.Brokers)
+	if err != nil {
+		return errors.Wrap(err, "unable to create new kafka connection")
+	}
+
+	brokers, err := conn.Brokers()
 	if err != nil {
 		return errors.Wrap(err, "unable to determine brokers")
 	}
@@ -228,7 +231,7 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 		k.Options.NumPartitionsPerTopic = 1
 	}
 
-	broker, err := k.Conn.Controller()
+	broker, err := conn.Controller()
 	if err != nil {
 		return errors.Wrap(err, "unable to find controller")
 	}
