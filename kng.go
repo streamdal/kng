@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"net"
-	"strconv"
 	"sync"
 	"time"
 
@@ -214,15 +212,27 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 	span, ctx := tracer.StartSpanFromContext(context.Background(), "kafka.CreateTopic")
 	defer span.Finish()
 
-	// Figure out number of brokers so we can set appropriate replication factor
-	conn, err := dialKafka(ctx, k.Dialer, k.Options.Brokers)
-	if err != nil {
-		return errors.Wrap(err, "unable to create new kafka connection")
+	cfg := sarama.NewConfig()
+
+	if k.Options.UseTLS {
+		cfg.Net.TLS.Enable = true
+		cfg.Net.TLS.Config = &tls.Config{
+			InsecureSkipVerify: true,
+		}
 	}
 
-	brokers, err := conn.Brokers()
+	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, cfg)
 	if err != nil {
-		return errors.Wrap(err, "unable to determine brokers")
+		err = errors.Wrap(err, "could not open new connection to kafka")
+		span.SetTag("error", err)
+		return err
+	}
+
+	brokers, _, err := clusterAdmin.DescribeCluster()
+	if err != nil {
+		err = errors.Wrap(err, "could not get broker list")
+		span.SetTag("error", err)
+		return err
 	}
 
 	// If local, we do not want to overload kafka - use sensible settings
@@ -231,22 +241,15 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 		k.Options.NumPartitionsPerTopic = 1
 	}
 
-	broker, err := conn.Controller()
-	if err != nil {
-		return errors.Wrap(err, "unable to find controller")
+	opts := &sarama.TopicDetail{
+		NumPartitions:     int32(k.Options.NumPartitionsPerTopic),
+		ReplicationFactor: int16(k.Options.ReplicationFactor),
 	}
 
-	controller, err := k.Dialer.DialContext(ctx, "tcp", net.JoinHostPort(broker.Host, strconv.Itoa(broker.Port)))
-	if err != nil {
-		return errors.Wrap(err, "unable to dial controller")
-	}
-
-	if err := controller.CreateTopics(kafka.TopicConfig{
-		Topic:             topic,
-		NumPartitions:     k.Options.NumPartitionsPerTopic,
-		ReplicationFactor: k.Options.ReplicationFactor,
-	}); err != nil {
-		return errors.Wrap(err, "unable to create topic")
+	if err := clusterAdmin.CreateTopic(topic, opts, false); err != nil {
+		err = errors.Wrap(err, "unable to create kafka topic")
+		span.SetTag("error", err)
+		return err
 	}
 
 	return nil
