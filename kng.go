@@ -473,7 +473,6 @@ func (p *Publisher) runBatchPublisher(ctx context.Context) {
 func (p *Publisher) WriteMessagesBatch(ctx context.Context, msgs []kafka.Message) error {
 	p.log.Debugf("creating a batch for %d msgs", len(msgs))
 
-	batchMutex := &sync.RWMutex{}
 	maxRetries := p.Kafka.Options.NumPublishRetries
 	batch := buildBatch(msgs, DefaultSubBatchSize)
 
@@ -485,14 +484,14 @@ MAIN:
 			case nil:
 				// No error, continue with the rest of the batches
 				continue MAIN
+			//case kafka.MessageTooLargeError:
+			// TODO: figure this out
 			case kafka.WriteErrors:
 				// Errors, pick out which messages failed and create a new batch with them
 				newBatch := make([]kafka.Message, 0)
 				for m := 0; m < len(err); m++ {
 					if err[m] != nil {
-						batchMutex.RLock()
 						newBatch = append(newBatch, b[m])
-						batchMutex.RUnlock()
 					}
 				}
 
