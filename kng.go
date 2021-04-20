@@ -26,6 +26,7 @@ const (
 	DefaultWorkerIdleTimeout     = time.Minute
 	DefaultReaderMaxWait         = 5 * time.Second
 	DefaultSubBatchSize          = 1000
+	DefaultMaxPublishRetries     = 3
 )
 
 type IKafka interface {
@@ -98,6 +99,7 @@ type Options struct {
 	// Producer specific settings
 	NumPartitionsPerTopic int
 	ReplicationFactor     int
+	NumPublishRetries     int
 
 	// ServiceShutdownContext is used by main() to shutdown services before application termination
 	ServiceShutdownContext context.Context
@@ -157,6 +159,10 @@ func New(opts *Options) (*Kafka, error) {
 
 	if k.Options.NumPartitionsPerTopic == 0 {
 		k.Options.NumPartitionsPerTopic = DefaultNumPartitionsPerTopic
+	}
+
+	if k.Options.NumPublishRetries == 0 {
+		k.Options.NumPublishRetries = DefaultMaxPublishRetries
 	}
 
 	// This goroutine waits for service cancel context to trigger and then loops until all publishers have pushed
@@ -312,7 +318,6 @@ func (k *Kafka) DeletePublisher(ctx context.Context, topic string) bool {
 
 	// Stop batch publisher goroutine
 	publisher.PublisherCancel()
-	publisher.Looper.Quit()
 
 	k.PublisherMutex.Lock()
 	delete(k.PublisherMap, topic)
@@ -418,7 +423,7 @@ func (p *Publisher) runBatchPublisher(ctx context.Context) {
 		p.QueueMutex.RUnlock()
 
 		if quit && remaining == 0 {
-			p.Kafka.DeletePublisher(ctx, p.Topic)
+			p.Looper.Quit()
 			return nil
 		}
 
@@ -455,14 +460,9 @@ func (p *Publisher) runBatchPublisher(ctx context.Context) {
 
 		lastArrivedAt = time.Now()
 
-		// Write the messages in the queue
-		if err := p.WriteMessagesBatch(ctx, tmpQueue); err != nil {
-			fullErr := fmt.Errorf("unable to write %d message(s): %s", len(p.Queue), err)
-			p.log.Error(fullErr)
-			span.SetTag("error", fullErr)
-
-			return nil
-		}
+		// This MUST be context.Background() otherwise the last batch of messages will fail to write since the
+		// publisher context has been cancelled.
+		p.WriteMessagesBatch(context.Background(), tmpQueue)
 
 		return nil
 	})
@@ -473,15 +473,38 @@ func (p *Publisher) runBatchPublisher(ctx context.Context) {
 func (p *Publisher) WriteMessagesBatch(ctx context.Context, msgs []kafka.Message) error {
 	p.log.Debugf("creating a batch for %d msgs", len(msgs))
 
+	batchMutex := &sync.RWMutex{}
+	maxRetries := p.Kafka.Options.NumPublishRetries
 	batch := buildBatch(msgs, DefaultSubBatchSize)
 
+MAIN:
 	for _, b := range batch {
-		if err := p.Writer.WriteMessages(ctx, b...); err != nil {
-			fullErr := fmt.Errorf("unable to write %d message(s): %s", len(b), err)
-			p.log.Error(fullErr)
+		var err error
+		for i := 1; i <= maxRetries; i++ {
+			switch err := p.Writer.WriteMessages(ctx, b...).(type) {
+			case nil:
+				// No error, continue with the rest of the batches
+				continue MAIN
+			case kafka.WriteErrors:
+				// Errors, pick out which messages failed and create a new batch with them
+				newBatch := make([]kafka.Message, 0)
+				for m := 0; m < len(err); m++ {
+					if err[m] != nil {
+						batchMutex.RLock()
+						newBatch = append(newBatch, b[m])
+						batchMutex.RUnlock()
+					}
+				}
 
-			return nil
+				b = newBatch
+
+				p.log.Errorf("unable to write %d message(s) [retry %d/%d]", len(b), i, maxRetries)
+			default:
+				p.log.Errorf("Got unknown error from kafka writer: %s", err)
+			}
 		}
+
+		p.log.Errorf("Failed to write %d messages(s) after %d retries: %s", len(b), maxRetries, err)
 	}
 
 	return nil
