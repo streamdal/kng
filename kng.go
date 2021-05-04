@@ -27,6 +27,7 @@ const (
 	DefaultReaderMaxWait         = 5 * time.Second
 	DefaultSubBatchSize          = 1000
 	DefaultMaxPublishRetries     = 3
+	DefaultPublishRetryInterval  = time.Second * 3
 )
 
 type IKafka interface {
@@ -101,6 +102,9 @@ type Options struct {
 	ReplicationFactor     int
 	NumPublishRetries     int
 
+	// PublishRetryInterval determines how long to wait between publish failures before it will try again
+	PublishRetryInterval time.Duration
+
 	// ServiceShutdownContext is used by main() to shutdown services before application termination
 	ServiceShutdownContext context.Context
 
@@ -163,6 +167,10 @@ func New(opts *Options) (*Kafka, error) {
 
 	if k.Options.NumPublishRetries == 0 {
 		k.Options.NumPublishRetries = DefaultMaxPublishRetries
+	}
+
+	if k.Options.PublishRetryInterval == 0 {
+		k.Options.PublishRetryInterval = DefaultPublishRetryInterval
 	}
 
 	// This goroutine waits for service cancel context to trigger and then loops until all publishers have pushed
@@ -500,6 +508,7 @@ MAIN:
 				p.log.Errorf("unable to write %d message(s) [retry %d/%d]", len(b), i, maxRetries)
 			default:
 				p.log.Errorf("Got unknown error from kafka writer: %s", err)
+				time.Sleep(p.Kafka.Options.PublishRetryInterval)
 			}
 		}
 
