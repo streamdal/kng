@@ -361,7 +361,18 @@ func (k *Kafka) watchForShutdown() {
 	k.log.Debugf("kafka received shutdown signal, waiting for all publishers to shut down")
 
 	// Loop until PublisherMap is empty
+	timeout := time.After(30 * time.Second)
+
+MAIN:
 	for {
+		select {
+		case <-timeout:
+			k.log.Warning("timed out waiting for publisher shutdown")
+			break MAIN
+		default:
+			// don't block on the timeout ch
+		}
+
 		k.PublisherMutex.RLock()
 		if len(k.PublisherMap) == 0 {
 			k.PublisherMutex.RUnlock()
