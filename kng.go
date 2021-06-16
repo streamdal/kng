@@ -443,6 +443,7 @@ func (p *Publisher) runBatchPublisher(ctx context.Context) {
 
 		if quit && remaining == 0 {
 			p.Looper.Quit()
+			p.Kafka.DeletePublisher(ctx, p.Topic)
 			return nil
 		}
 
