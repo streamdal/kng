@@ -12,6 +12,8 @@ import (
 	"github.com/relistan/go-director"
 	uuid "github.com/satori/go.uuid"
 	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/sasl/plain"
+	"github.com/segmentio/kafka-go/sasl/scram"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
@@ -28,6 +30,11 @@ const (
 	DefaultSubBatchSize          = 1000
 	DefaultMaxPublishRetries     = 3
 	DefaultPublishRetryInterval  = time.Second * 3
+)
+
+var (
+	ErrMissingUsername = errors.New("missing username for SASL authentication")
+	ErrMissingPassword = errors.New("missing passwird for SASL authentication")
 )
 
 type IKafka interface {
@@ -93,6 +100,11 @@ type Options struct {
 	UseTLS            bool
 	WorkerIdleTimeout time.Duration
 
+	// Authentication
+	SaslType string
+	Username string
+	Password string
+
 	// Consumer specific settings
 	ReaderMaxWait       time.Duration
 	ReaderUseLastOffset bool
@@ -126,6 +138,30 @@ func New(opts *Options) (*Kafka, error) {
 	if opts.UseTLS {
 		dialer.TLS = &tls.Config{
 			InsecureSkipVerify: true,
+		}
+	}
+
+	// SASL Authentication
+	if opts.SaslType != "" {
+		if opts.Username == "" {
+			return nil, ErrMissingUsername
+		}
+		if opts.Password == "" {
+			return nil, ErrMissingPassword
+		}
+
+		switch opts.SaslType {
+		case "scram":
+			mechanism, err := scram.Mechanism(scram.SHA512, opts.Username, opts.Password)
+			if err != nil {
+				return nil, errors.Wrap(err, "unable to initiate scram authentication")
+			}
+			dialer.SASLMechanism = mechanism
+		default:
+			dialer.SASLMechanism = plain.Mechanism{
+				Username: opts.Username,
+				Password: opts.Password,
+			}
 		}
 	}
 
@@ -222,10 +258,7 @@ func (k *Kafka) Publish(ctx context.Context, topic string, value []byte) {
 	k.getPublisherByTopic(topic).batch(ctx, value)
 }
 
-func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
-	span, ctx := tracer.StartSpanFromContext(context.Background(), "kafka.CreateTopic")
-	defer span.Finish()
-
+func (k *Kafka) getSaramaConfig() *sarama.Config {
 	cfg := sarama.NewConfig()
 
 	if k.Options.UseTLS {
@@ -235,7 +268,25 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 		}
 	}
 
-	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, cfg)
+	if k.Options.SaslType != "" {
+		cfg.Net.SASL.Enable = true
+		cfg.Net.SASL.User = k.Options.Username
+		cfg.Net.SASL.Password = k.Options.Password
+		if k.Options.SaslType == "scram" {
+			cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+		} else {
+			cfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+		}
+	}
+
+	return cfg
+}
+
+func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
+	span, ctx := tracer.StartSpanFromContext(context.Background(), "kafka.CreateTopic")
+	defer span.Finish()
+
+	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, k.getSaramaConfig())
 	if err != nil {
 		err = errors.Wrap(err, "could not open new connection to kafka")
 		span.SetTag("error", err)
@@ -278,16 +329,7 @@ func (k *Kafka) DeleteTopic(ctx context.Context, topic string) error {
 	// Sarama is the only library capable of deleting topics from our kafka cluster
 	// Kafka-go doesn't work at all
 	// Confluent does not support TLS
-	cfg := sarama.NewConfig()
-
-	if k.Options.UseTLS {
-		cfg.Net.TLS.Enable = true
-		cfg.Net.TLS.Config = &tls.Config{
-			InsecureSkipVerify: true,
-		}
-	}
-
-	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, cfg)
+	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, k.getSaramaConfig())
 	if err != nil {
 		err = errors.Wrap(err, "could not open new connection to kafka")
 		span.SetTag("error", err)

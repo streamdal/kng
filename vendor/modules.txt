@@ -160,6 +160,8 @@ github.com/segmentio/kafka-go/protocol/produce
 github.com/segmentio/kafka-go/protocol/saslauthenticate
 github.com/segmentio/kafka-go/protocol/saslhandshake
 github.com/segmentio/kafka-go/sasl
+github.com/segmentio/kafka-go/sasl/plain
+github.com/segmentio/kafka-go/sasl/scram
 # github.com/sirupsen/logrus v1.8.1
 ## explicit
 github.com/sirupsen/logrus
@@ -167,6 +169,10 @@ github.com/sirupsen/logrus
 ## explicit
 # github.com/tinylib/msgp v1.1.2
 github.com/tinylib/msgp/msgp
+# github.com/xdg/scram v0.0.0-20180814205039-7eeb5667e42c
+github.com/xdg/scram
+# github.com/xdg/stringprep v1.0.0
+github.com/xdg/stringprep
 # golang.org/x/crypto v0.0.0-20201221181555-eec23a3978ad
 golang.org/x/crypto/md4
 golang.org/x/crypto/pbkdf2
@@ -200,6 +206,7 @@ golang.org/x/text/internal/utf8internal
 golang.org/x/text/language
 golang.org/x/text/runes
 golang.org/x/text/transform
+golang.org/x/text/unicode/norm
 # golang.org/x/time v0.0.0-20210220033141-f8bda1e9f3ba
 ## explicit
 golang.org/x/time/rate
