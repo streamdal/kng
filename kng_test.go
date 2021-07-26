@@ -183,6 +183,34 @@ var _ = Describe("kng", func() {
 			}
 		})
 	})
+
+	Context("New", func() {
+		It("should error whe no username present", func() {
+			_, err := New(&Options{
+				Brokers:                kafkaBrokers,
+				ServiceShutdownContext: context.Background(),
+				MainShutdownFunc:       func() {},
+				SaslType:               "plain",
+				Username:               "",
+				Password:               "",
+			})
+
+			Expect(err).To(Equal(ErrMissingUsername))
+		})
+
+		It("should error whe no username present", func() {
+			_, err := New(&Options{
+				Brokers:                kafkaBrokers,
+				ServiceShutdownContext: context.Background(),
+				MainShutdownFunc:       func() {},
+				SaslType:               "plain",
+				Username:               "testing",
+				Password:               "",
+			})
+
+			Expect(err).To(Equal(ErrMissingPassword))
+		})
+	})
 })
 
 func read(brokers []string, topic string) ([]byte, error) {
