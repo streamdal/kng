@@ -175,7 +175,8 @@ func New(opts *Options) (*Kafka, error) {
 	transport := &kafka.Transport{
 		DialTimeout: opts.Timeout,
 		// Bug? TLS has to be specified here; TLS on dialer doesn't work.
-		TLS: dialer.TLS,
+		TLS:  dialer.TLS,
+		SASL: dialer.SASLMechanism,
 	}
 
 	k := &Kafka{
