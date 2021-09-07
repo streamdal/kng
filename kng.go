@@ -123,6 +123,8 @@ type Options struct {
 	// MainShutdownFunc is triggered by watchForShutdown() after all publisher queues are exhausted
 	// and is used to trigger shutdown of APIs and then main()
 	MainShutdownFunc context.CancelFunc
+
+	EnableKafkaGoLogs bool
 }
 
 // New is used for instantiating the library.
@@ -179,6 +181,8 @@ func New(opts *Options) (*Kafka, error) {
 		SASL: dialer.SASLMechanism,
 	}
 
+	llog := logrus.WithField("pkg", "kafka")
+
 	k := &Kafka{
 		Writer: &kafka.Writer{
 			Addr:      kafka.TCP(opts.Brokers...),
@@ -191,7 +195,12 @@ func New(opts *Options) (*Kafka, error) {
 		Options:                opts,
 		ServiceShutdownContext: opts.ServiceShutdownContext,
 		MainShutdownFunc:       opts.MainShutdownFunc,
-		log:                    logrus.WithField("pkg", "kafka"),
+		log:                    llog,
+	}
+
+	if k.Options.EnableKafkaGoLogs {
+		k.Writer.Logger = kafka.LoggerFunc(llog.Infof)
+		k.Writer.ErrorLogger = kafka.LoggerFunc(llog.Errorf)
 	}
 
 	if k.Options.ReplicationFactor == 0 {
@@ -219,12 +228,19 @@ func New(opts *Options) (*Kafka, error) {
 
 // NewReader creates a new reader instance.
 func (k *Kafka) NewReader(id, groupID, topic string) *Reader {
+	llog := logrus.WithField("readerID", id)
+
 	readerConfig := kafka.ReaderConfig{
 		Brokers: k.Options.Brokers,
 		GroupID: groupID,
 		Topic:   topic,
 		MaxWait: k.Options.ReaderMaxWait,
 		Dialer:  k.Dialer,
+	}
+
+	if k.Options.EnableKafkaGoLogs {
+		k.Writer.Logger = kafka.LoggerFunc(llog.Infof)
+		k.Writer.ErrorLogger = kafka.LoggerFunc(llog.Errorf)
 	}
 
 	if k.Options.ReaderUseLastOffset {
@@ -234,7 +250,7 @@ func (k *Kafka) NewReader(id, groupID, topic string) *Reader {
 	return &Reader{
 		ID:     id,
 		Reader: kafka.NewReader(readerConfig),
-		log:    logrus.WithField("readerID", id),
+		log:    llog,
 	}
 }
 
