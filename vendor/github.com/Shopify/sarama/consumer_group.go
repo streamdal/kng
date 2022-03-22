@@ -7,6 +7,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/rcrowley/go-metrics"
 )
 
 // ErrClosedConsumerGroup is the error returned when a method is called on a consumer group that has been closed.
@@ -28,7 +30,7 @@ type ConsumerGroup interface {
 	//    in a separate goroutine which requires it to be thread-safe. Any state must be carefully protected
 	//    from concurrent reads/writes.
 	// 4. The session will persist until one of the ConsumeClaim() functions exits. This can be either when the
-	//    parent context is cancelled or when a server-side rebalance cycle is initiated.
+	//    parent context is canceled or when a server-side rebalance cycle is initiated.
 	// 5. Once all the ConsumeClaim() loops have exited, the handler's Cleanup() hook is called
 	//    to allow the user to perform any final tasks before a rebalance.
 	// 6. Finally, marked offsets are committed one last time before claims are released.
@@ -52,6 +54,26 @@ type ConsumerGroup interface {
 	// Close stops the ConsumerGroup and detaches any running sessions. It is required to call
 	// this function before the object passes out of scope, as it will otherwise leak memory.
 	Close() error
+
+	// Pause suspends fetching from the requested partitions. Future calls to the broker will not return any
+	// records from these partitions until they have been resumed using Resume()/ResumeAll().
+	// Note that this method does not affect partition subscription.
+	// In particular, it does not cause a group rebalance when automatic assignment is used.
+	Pause(partitions map[string][]int32)
+
+	// Resume resumes specified partitions which have been paused with Pause()/PauseAll().
+	// New calls to the broker will return records from these partitions if there are any to be fetched.
+	Resume(partitions map[string][]int32)
+
+	// Pause suspends fetching from all partitions. Future calls to the broker will not return any
+	// records from these partitions until they have been resumed using Resume()/ResumeAll().
+	// Note that this method does not affect partition subscription.
+	// In particular, it does not cause a group rebalance when automatic assignment is used.
+	PauseAll()
+
+	// Resume resumes all partitions which have been paused with Pause()/PauseAll().
+	// New calls to the broker will return records from these partitions if there are any to be fetched.
+	ResumeAll()
 }
 
 type consumerGroup struct {
@@ -112,6 +134,7 @@ func newConsumerGroup(groupID string, client Client) (ConsumerGroup, error) {
 		groupID:  groupID,
 		errors:   make(chan error, config.ChannelBufferSize),
 		closed:   make(chan none),
+		userData: config.Consumer.Group.Member.UserData,
 	}, nil
 }
 
@@ -185,6 +208,26 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 	return sess.release(true)
 }
 
+// Pause implements ConsumerGroup.
+func (c *consumerGroup) Pause(partitions map[string][]int32) {
+	c.consumer.Pause(partitions)
+}
+
+// Resume implements ConsumerGroup.
+func (c *consumerGroup) Resume(partitions map[string][]int32) {
+	c.consumer.Resume(partitions)
+}
+
+// PauseAll implements ConsumerGroup.
+func (c *consumerGroup) PauseAll() {
+	c.consumer.PauseAll()
+}
+
+// ResumeAll implements ConsumerGroup.
+func (c *consumerGroup) ResumeAll() {
+	c.consumer.ResumeAll()
+}
+
 func (c *consumerGroup) retryNewSession(ctx context.Context, topics []string, handler ConsumerGroupHandler, retries int, refreshCoordinator bool) (*consumerGroupSession, error) {
 	select {
 	case <-c.closed:
@@ -212,11 +255,37 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		return c.retryNewSession(ctx, topics, handler, retries, true)
 	}
 
+	var (
+		metricRegistry          = c.config.MetricRegistry
+		consumerGroupJoinTotal  metrics.Counter
+		consumerGroupJoinFailed metrics.Counter
+		consumerGroupSyncTotal  metrics.Counter
+		consumerGroupSyncFailed metrics.Counter
+	)
+
+	if metricRegistry != nil {
+		consumerGroupJoinTotal = metrics.GetOrRegisterCounter(fmt.Sprintf("consumer-group-join-total-%s", c.groupID), metricRegistry)
+		consumerGroupJoinFailed = metrics.GetOrRegisterCounter(fmt.Sprintf("consumer-group-join-failed-%s", c.groupID), metricRegistry)
+		consumerGroupSyncTotal = metrics.GetOrRegisterCounter(fmt.Sprintf("consumer-group-sync-total-%s", c.groupID), metricRegistry)
+		consumerGroupSyncFailed = metrics.GetOrRegisterCounter(fmt.Sprintf("consumer-group-sync-failed-%s", c.groupID), metricRegistry)
+	}
+
 	// Join consumer group
 	join, err := c.joinGroupRequest(coordinator, topics)
+	if consumerGroupJoinTotal != nil {
+		consumerGroupJoinTotal.Inc(1)
+	}
 	if err != nil {
 		_ = coordinator.Close()
+		if consumerGroupJoinFailed != nil {
+			consumerGroupJoinFailed.Inc(1)
+		}
 		return nil, err
+	}
+	if join.Err != ErrNoError {
+		if consumerGroupJoinFailed != nil {
+			consumerGroupJoinFailed.Inc(1)
+		}
 	}
 	switch join.Err {
 	case ErrNoError:
@@ -256,10 +325,22 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 
 	// Sync consumer group
 	groupRequest, err := c.syncGroupRequest(coordinator, plan, join.GenerationId)
+	if consumerGroupSyncTotal != nil {
+		consumerGroupSyncTotal.Inc(1)
+	}
 	if err != nil {
 		_ = coordinator.Close()
+		if consumerGroupSyncFailed != nil {
+			consumerGroupSyncFailed.Inc(1)
+		}
 		return nil, err
 	}
+	if groupRequest.Err != ErrNoError {
+		if consumerGroupSyncFailed != nil {
+			consumerGroupSyncFailed.Inc(1)
+		}
+	}
+
 	switch groupRequest.Err {
 	case ErrNoError:
 	case ErrUnknownMemberId, ErrIllegalGeneration: // reset member ID and retry immediately
@@ -289,7 +370,15 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 			return nil, err
 		}
 		claims = members.Topics
-		c.userData = members.UserData
+
+		// in the case of stateful balance strategies, hold on to the returned
+		// assignment metadata, otherwise, reset the statically defined conusmer
+		// group metadata
+		if members.UserData != nil {
+			c.userData = members.UserData
+		} else {
+			c.userData = c.config.Consumer.Group.Member.UserData
+		}
 
 		for _, partitions := range claims {
 			sort.Sort(int32Slice(partitions))
@@ -311,14 +400,9 @@ func (c *consumerGroup) joinGroupRequest(coordinator *Broker, topics []string) (
 		req.RebalanceTimeout = int32(c.config.Consumer.Group.Rebalance.Timeout / time.Millisecond)
 	}
 
-	// use static user-data if configured, otherwise use consumer-group userdata from the last sync
-	userData := c.config.Consumer.Group.Member.UserData
-	if len(userData) == 0 {
-		userData = c.userData
-	}
 	meta := &ConsumerGroupMemberMetadata{
 		Topics:   topics,
-		UserData: userData,
+		UserData: c.userData,
 	}
 	strategy := c.config.Consumer.Group.Rebalance.Strategy
 	if err := req.AddGroupProtocolMetadata(strategy.Name(), meta); err != nil {
@@ -429,7 +513,7 @@ func (c *consumerGroup) handleError(err error, topic string, partition int32) {
 
 	select {
 	case <-c.closed:
-		//consumer is closed
+		// consumer is closed
 		return
 	default:
 	}
@@ -463,7 +547,9 @@ func (c *consumerGroup) loopCheckPartitionNumbers(topics []string, session *cons
 		select {
 		case <-pause.C:
 		case <-session.ctx.Done():
-			Logger.Printf("loop check partition number coroutine will exit, topics %s", topics)
+			Logger.Printf(
+				"consumergroup/%s loop check partition number coroutine will exit, topics %s\n",
+				c.groupID, topics)
 			// if session closed by other, should be exited
 			return
 		case <-c.closed:
@@ -476,7 +562,9 @@ func (c *consumerGroup) topicToPartitionNumbers(topics []string) (map[string]int
 	topicToPartitionNum := make(map[string]int, len(topics))
 	for _, topic := range topics {
 		if partitionNum, err := c.client.Partitions(topic); err != nil {
-			Logger.Printf("Consumer Group topic %s get partition number failed %v", topic, err)
+			Logger.Printf(
+				"consumergroup/%s topic %s get partition number failed %v\n",
+				c.groupID, err)
 			return nil, err
 		} else {
 			topicToPartitionNum[topic] = len(partitionNum)
@@ -722,15 +810,27 @@ func (s *consumerGroupSession) release(withCleanup bool) (err error) {
 		<-s.hbDead
 	})
 
+	Logger.Printf(
+		"consumergroup/session/%s/%d released\n",
+		s.MemberID(), s.GenerationID())
+
 	return
 }
 
 func (s *consumerGroupSession) heartbeatLoop() {
 	defer close(s.hbDead)
 	defer s.cancel() // trigger the end of the session on exit
+	defer func() {
+		Logger.Printf(
+			"consumergroup/session/%s/%d heartbeat loop stopped\n",
+			s.MemberID(), s.GenerationID())
+	}()
 
 	pause := time.NewTicker(s.parent.config.Consumer.Group.Heartbeat.Interval)
 	defer pause.Stop()
+
+	retryBackoff := time.NewTimer(s.parent.config.Metadata.Retry.Backoff)
+	defer retryBackoff.Stop()
 
 	retries := s.parent.config.Metadata.Retry.Max
 	for {
@@ -740,11 +840,11 @@ func (s *consumerGroupSession) heartbeatLoop() {
 				s.parent.handleError(err, "", -1)
 				return
 			}
-
+			retryBackoff.Reset(s.parent.config.Metadata.Retry.Backoff)
 			select {
 			case <-s.hbDying:
 				return
-			case <-time.After(s.parent.config.Metadata.Retry.Backoff):
+			case <-retryBackoff.C:
 				retries--
 			}
 			continue
@@ -766,7 +866,10 @@ func (s *consumerGroupSession) heartbeatLoop() {
 		switch resp.Err {
 		case ErrNoError:
 			retries = s.parent.config.Metadata.Retry.Max
-		case ErrRebalanceInProgress, ErrUnknownMemberId, ErrIllegalGeneration:
+		case ErrRebalanceInProgress:
+			retries = s.parent.config.Metadata.Retry.Max
+			s.cancel()
+		case ErrUnknownMemberId, ErrIllegalGeneration:
 			return
 		default:
 			s.parent.handleError(resp.Err, "", -1)
