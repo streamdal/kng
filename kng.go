@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Shopify/sarama"
 	"github.com/pkg/errors"
 	"github.com/relistan/go-director"
 	uuid "github.com/satori/go.uuid"
@@ -15,6 +14,11 @@ import (
 	"github.com/segmentio/kafka-go/sasl/plain"
 	"github.com/segmentio/kafka-go/sasl/scram"
 	"github.com/sirupsen/logrus"
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
+	kgoScram "github.com/twmb/franz-go/pkg/sasl/scram"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
@@ -34,7 +38,7 @@ const (
 
 var (
 	ErrMissingUsername = errors.New("missing username for SASL authentication")
-	ErrMissingPassword = errors.New("missing passwird for SASL authentication")
+	ErrMissingPassword = errors.New("missing password for SASL authentication")
 )
 
 type IKafka interface {
@@ -43,6 +47,7 @@ type IKafka interface {
 	DeletePublisher(ctx context.Context, topic string) bool
 	DeleteTopic(ctx context.Context, topic string) error
 	CreateTopic(ctx context.Context, topic string) error
+	ListTopics(ctx context.Context) (map[string]kadm.TopicDetail, error)
 }
 
 type IReader interface {
@@ -275,88 +280,151 @@ func (k *Kafka) Publish(ctx context.Context, topic string, value []byte) {
 	k.getPublisherByTopic(topic).batch(ctx, value)
 }
 
-func (k *Kafka) getSaramaConfig() *sarama.Config {
-	cfg := sarama.NewConfig()
+func (k *Kafka) getKgoConfig() (*kgo.Client, error) {
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(k.Options.Brokers...),
+		kgo.ClientID("kng"),
+		kgo.RetryTimeout(5 * time.Second), // TODO: configurable
+
+		// Redpanda may indicate one leader just before rebalancing the
+		// leader to a different server. During this rebalance,
+		// Redpanda may return stale metadata. We always want fresh
+		// metadata, and we want it fast since this is a CLI, so we
+		// will use a small min metadata age.
+		//
+		// https://github.com/redpanda-data/redpanda/issues/2546
+		kgo.MetadataMinAge(250 * time.Millisecond),
+	}
 
 	if k.Options.UseTLS {
-		cfg.Net.TLS.Enable = true
-		cfg.Net.TLS.Config = &tls.Config{
+		opts = append(opts, kgo.DialTLSConfig(&tls.Config{
 			InsecureSkipVerify: true,
-		}
+		}))
 	}
 
 	if k.Options.SaslType != "" {
-		cfg.Net.SASL.Enable = true
-		cfg.Net.SASL.User = k.Options.Username
-		cfg.Net.SASL.Password = k.Options.Password
+		mech := kgoScram.Auth{
+			User: k.Options.Username,
+			Pass: k.Options.Password,
+		}
 		if k.Options.SaslType == "scram" {
-			cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
-		} else {
-			cfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+			opts = append(opts, kgo.SASL(mech.AsSha512Mechanism()))
 		}
 	}
 
-	return cfg
+	return kgo.NewClient(opts...)
+}
+
+func (k *Kafka) getKgoAdmin() (*kadm.Client, error) {
+	cl, err := k.getKgoConfig()
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to instantiate kgo client")
+	}
+
+	adm := kadm.NewClient(cl)
+	adm.SetTimeoutMillis(5000)
+	return adm, nil
 }
 
 func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 	span, ctx := tracer.StartSpanFromContext(context.Background(), "kafka.CreateTopic")
 	defer span.Finish()
 
-	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, k.getSaramaConfig())
+	cl, err := k.getKgoConfig()
 	if err != nil {
-		err = errors.Wrap(err, "could not open new connection to kafka")
-		span.SetTag("error", err)
-		return err
+		return errors.Wrap(err, "unable to instantiate kgo client")
 	}
 
-	brokers, _, err := clusterAdmin.DescribeCluster()
+	req := kmsg.NewPtrCreateTopicsRequest()
+	req.TimeoutMillis = 5000
+
+	// TODO: unsure if we need others
+	configs := map[string]string{
+		"cleanup.policy": "delete",
+	}
+
+	var reqConfigs []kmsg.CreateTopicsRequestTopicConfig
+	for k, v := range configs {
+		reqConfig := kmsg.NewCreateTopicsRequestTopicConfig()
+		reqConfig.Name = k
+		reqConfig.Value = kmsg.StringPtr(v)
+		reqConfigs = append(reqConfigs, reqConfig)
+	}
+
+	reqTopic := kmsg.NewCreateTopicsRequestTopic()
+	reqTopic.Topic = topic
+	reqTopic.Configs = reqConfigs
+	reqTopic.ReplicationFactor = int16(k.Options.ReplicationFactor)
+	reqTopic.NumPartitions = int32(k.Options.NumPartitionsPerTopic)
+
+	println("REPLICATION FACTOR: ", k.Options.ReplicationFactor)
+
+	// TODO: how to get broker list from server?
+	//if len(brokers) == 1 {
+	//	k.Options.ReplicationFactor = 1
+	//	k.Options.NumPartitionsPerTopic = 1
+	//}
+
+	req.Topics = append(req.Topics, reqTopic)
+
+	resp, err := req.RequestWith(context.Background(), cl)
 	if err != nil {
-		err = errors.Wrap(err, "could not get broker list")
-		span.SetTag("error", err)
-		return err
+		return errors.Wrapf(err, "unable to create topic %v: %v", topic, err)
 	}
 
-	// If local, we do not want to overload kafka - use sensible settings
-	if len(brokers) == 1 {
-		k.Options.ReplicationFactor = 1
-		k.Options.NumPartitionsPerTopic = 1
-	}
-
-	opts := &sarama.TopicDetail{
-		NumPartitions:     int32(k.Options.NumPartitionsPerTopic),
-		ReplicationFactor: int16(k.Options.ReplicationFactor),
-	}
-
-	if err := clusterAdmin.CreateTopic(topic, opts, false); err != nil {
-		err = errors.Wrap(err, "unable to create kafka topic")
-		span.SetTag("error", err)
-		return err
+	for _, topicResp := range resp.Topics {
+		if err := kerr.ErrorForCode(topicResp.ErrorCode); err != nil {
+			err = errors.Wrapf(err, "unable to create topic '%s'", topic)
+			span.SetTag("error", err)
+			return err
+		}
 	}
 
 	return nil
 }
 
-// DeleteTopic deletes a topic from Kafka. It uses the Shopify/sarama library
-// as we were running into problems doing the same with segmentio/kafka-go.
+func (k *Kafka) ListTopics(ctx context.Context) (map[string]kadm.TopicDetail, error) {
+	clusterAdmin, err := k.getKgoAdmin()
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to instantiate kgo client")
+	}
+
+	topics, err := clusterAdmin.ListInternalTopics(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to list topics")
+	}
+
+	out := make(map[string]kadm.TopicDetail)
+
+	for _, topic := range topics {
+		out[topic.Topic] = topic
+	}
+
+	return out, nil
+}
+
+// DeleteTopic deletes a topic from Kafka. It uses the twmb/franz-go library
+// as we were running into problems doing the same with segmentio/kafka-go and shopify/sarama
 func (k *Kafka) DeleteTopic(ctx context.Context, topic string) error {
 	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.DeleteTopic")
 	defer span.Finish()
 
-	// Sarama is the only library capable of deleting topics from our kafka cluster
-	// Kafka-go doesn't work at all
-	// Confluent does not support TLS
-	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, k.getSaramaConfig())
+	clusterAdmin, err := k.getKgoAdmin()
 	if err != nil {
 		err = errors.Wrap(err, "could not open new connection to kafka")
 		span.SetTag("error", err)
 		return err
 	}
 
-	if err := clusterAdmin.DeleteTopic(topic); err != nil {
-		err = errors.Wrap(err, "unable to delete kafka topic")
-		span.SetTag("error", err)
-		return err
+	deleteResponses, err := clusterAdmin.DeleteTopics(ctx, topic)
+	if err != nil {
+		return errors.Wrapf(err, "unable to delete topic '%s'", topic)
+	}
+
+	for _, resp := range deleteResponses.Sorted() {
+		if resp.Err != nil {
+			return errors.Wrapf(resp.Err, "unable to delete topic '%s'", topic)
+		}
 	}
 
 	return nil
