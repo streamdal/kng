@@ -10,6 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@main
+      - uses: actions/setup-go@v2
+        with:
+          go-version: '^1.16.1'
+      - run: go version
       - name: Start up dependencies
         run: docker-compose up -d
       - name: Wait for dependencies to start up
