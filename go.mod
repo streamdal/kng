@@ -4,7 +4,7 @@ go 1.15
 
 require (
 	github.com/Microsoft/go-winio v0.4.16 // indirect
-	github.com/Shopify/sarama v1.28.0
+	github.com/Shopify/sarama v1.32.0
 	github.com/google/uuid v1.2.0 // indirect
 	github.com/onsi/ginkgo v1.16.1
 	github.com/onsi/gomega v1.11.0

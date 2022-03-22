@@ -28,7 +28,7 @@ type Broker struct {
 	connErr       error
 	lock          sync.Mutex
 	opened        int32
-	responses     chan responsePromise
+	responses     chan *responsePromise
 	done          chan bool
 
 	registeredMetrics []string
@@ -49,6 +49,7 @@ type Broker struct {
 	brokerResponseRate     metrics.Meter
 	brokerResponseSize     metrics.Histogram
 	brokerRequestsInFlight metrics.Counter
+	brokerThrottleTime     metrics.Histogram
 
 	kerberosAuthenticator GSSAPIKerberosAuth
 }
@@ -120,8 +121,23 @@ type responsePromise struct {
 	requestTime   time.Time
 	correlationID int32
 	headerVersion int16
+	handler       func([]byte, error)
 	packets       chan []byte
 	errors        chan error
+}
+
+func (p *responsePromise) handle(packets []byte, err error) {
+	// Use callback when provided
+	if p.handler != nil {
+		p.handler(packets, err)
+		return
+	}
+	// Otherwise fallback to using channels
+	if err != nil {
+		p.errors <- err
+		return
+	}
+	p.packets <- packets
 }
 
 // NewBroker creates and returns a Broker targeting the given host:port address.
@@ -149,11 +165,28 @@ func (b *Broker) Open(conf *Config) error {
 		return err
 	}
 
+	usingApiVersionsRequests := conf.Version.IsAtLeast(V2_4_0_0) && conf.ApiVersionsRequest
+
 	b.lock.Lock()
 
 	go withRecover(func() {
-		defer b.lock.Unlock()
+		defer func() {
+			b.lock.Unlock()
 
+			// Send an ApiVersionsRequest to identify the client (KIP-511).
+			// Ideally Sarama would use the response to control protocol versions,
+			// but for now just fire-and-forget just to send
+			if usingApiVersionsRequests {
+				_, err = b.ApiVersions(&ApiVersionsRequest{
+					Version:               3,
+					ClientSoftwareName:    defaultClientSoftwareName,
+					ClientSoftwareVersion: version(),
+				})
+				if err != nil {
+					Logger.Printf("Error while sending ApiVersionsRequest to broker %s: %s\n", b.addr, err)
+				}
+			}
+		}()
 		dialer := conf.getDialer()
 		b.conn, b.connErr = dialer.Dial("tcp", b.addr)
 		if b.connErr != nil {
@@ -180,7 +213,7 @@ func (b *Broker) Open(conf *Config) error {
 		b.requestsInFlight = metrics.GetOrRegisterCounter("requests-in-flight", conf.MetricRegistry)
 		// Do not gather metrics for seeded broker (only used during bootstrap) because they share
 		// the same id (-1) and are already exposed through the global metrics above
-		if b.id >= 0 {
+		if b.id >= 0 && !metrics.UseNilMetrics {
 			b.registerMetrics()
 		}
 
@@ -190,7 +223,7 @@ func (b *Broker) Open(conf *Config) error {
 			if b.connErr != nil {
 				err = b.conn.Close()
 				if err == nil {
-					Logger.Printf("Closed connection to broker %s\n", b.addr)
+					DebugLogger.Printf("Closed connection to broker %s\n", b.addr)
 				} else {
 					Logger.Printf("Error while closing connection to broker %s: %s\n", b.addr, err)
 				}
@@ -201,12 +234,12 @@ func (b *Broker) Open(conf *Config) error {
 		}
 
 		b.done = make(chan bool)
-		b.responses = make(chan responsePromise, b.conf.Net.MaxOpenRequests-1)
+		b.responses = make(chan *responsePromise, b.conf.Net.MaxOpenRequests-1)
 
 		if b.id >= 0 {
-			Logger.Printf("Connected to broker at %s (registered as #%d)\n", b.addr, b.id)
+			DebugLogger.Printf("Connected to broker at %s (registered as #%d)\n", b.addr, b.id)
 		} else {
-			Logger.Printf("Connected to broker at %s (unregistered)\n", b.addr)
+			DebugLogger.Printf("Connected to broker at %s (unregistered)\n", b.addr)
 		}
 		go withRecover(b.responseReceiver)
 	})
@@ -223,7 +256,25 @@ func (b *Broker) Connected() (bool, error) {
 	return b.conn != nil, b.connErr
 }
 
-//Close closes the broker resources
+// TLSConnectionState returns the client's TLS connection state. The second return value is false if this is not a tls connection or the connection has not yet been established.
+func (b *Broker) TLSConnectionState() (state tls.ConnectionState, ok bool) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+
+	if b.conn == nil {
+		return state, false
+	}
+	conn := b.conn
+	if bconn, ok := b.conn.(*bufConn); ok {
+		conn = bconn.Conn
+	}
+	if tc, ok := conn.(*tls.Conn); ok {
+		return tc.ConnectionState(), true
+	}
+	return state, false
+}
+
+// Close closes the broker resources
 func (b *Broker) Close() error {
 	b.lock.Lock()
 	defer b.lock.Unlock()
@@ -245,7 +296,7 @@ func (b *Broker) Close() error {
 	b.unregisterMetrics()
 
 	if err == nil {
-		Logger.Printf("Closed connection to broker %s\n", b.addr)
+		DebugLogger.Printf("Closed connection to broker %s\n", b.addr)
 	} else {
 		Logger.Printf("Error while closing connection to broker %s: %s\n", b.addr, err)
 	}
@@ -276,12 +327,11 @@ func (b *Broker) Rack() string {
 	return *b.rack
 }
 
-//GetMetadata send a metadata request and returns a metadata response or error
+// GetMetadata send a metadata request and returns a metadata response or error
 func (b *Broker) GetMetadata(request *MetadataRequest) (*MetadataResponse, error) {
 	response := new(MetadataResponse)
 
 	err := b.sendAndReceive(request, response)
-
 	if err != nil {
 		return nil, err
 	}
@@ -289,12 +339,11 @@ func (b *Broker) GetMetadata(request *MetadataRequest) (*MetadataResponse, error
 	return response, nil
 }
 
-//GetConsumerMetadata send a consumer metadata request and returns a consumer metadata response or error
+// GetConsumerMetadata send a consumer metadata request and returns a consumer metadata response or error
 func (b *Broker) GetConsumerMetadata(request *ConsumerMetadataRequest) (*ConsumerMetadataResponse, error) {
 	response := new(ConsumerMetadataResponse)
 
 	err := b.sendAndReceive(request, response)
-
 	if err != nil {
 		return nil, err
 	}
@@ -302,12 +351,11 @@ func (b *Broker) GetConsumerMetadata(request *ConsumerMetadataRequest) (*Consume
 	return response, nil
 }
 
-//FindCoordinator sends a find coordinate request and returns a response or error
+// FindCoordinator sends a find coordinate request and returns a response or error
 func (b *Broker) FindCoordinator(request *FindCoordinatorRequest) (*FindCoordinatorResponse, error) {
 	response := new(FindCoordinatorResponse)
 
 	err := b.sendAndReceive(request, response)
-
 	if err != nil {
 		return nil, err
 	}
@@ -315,17 +363,66 @@ func (b *Broker) FindCoordinator(request *FindCoordinatorRequest) (*FindCoordina
 	return response, nil
 }
 
-//GetAvailableOffsets return an offset response or error
+// GetAvailableOffsets return an offset response or error
 func (b *Broker) GetAvailableOffsets(request *OffsetRequest) (*OffsetResponse, error) {
 	response := new(OffsetResponse)
 
 	err := b.sendAndReceive(request, response)
-
 	if err != nil {
 		return nil, err
 	}
 
 	return response, nil
+}
+
+// ProduceCallback function is called once the produce response has been parsed
+// or could not be read.
+type ProduceCallback func(*ProduceResponse, error)
+
+// AsyncProduce sends a produce request and eventually call the provided callback
+// with a produce response or an error.
+//
+// Waiting for the response is generally not blocking on the contrary to using Produce.
+// If the maximum number of in flight request configured is reached then
+// the request will be blocked till a previous response is received.
+//
+// When configured with RequiredAcks == NoResponse, the callback will not be invoked.
+// If an error is returned because the request could not be sent then the callback
+// will not be invoked either.
+//
+// Make sure not to Close the broker in the callback as it will lead to a deadlock.
+func (b *Broker) AsyncProduce(request *ProduceRequest, cb ProduceCallback) error {
+	needAcks := request.RequiredAcks != NoResponse
+	// Use a nil promise when no acks is required
+	var promise *responsePromise
+
+	if needAcks {
+		// Create ProduceResponse early to provide the header version
+		res := new(ProduceResponse)
+		promise = &responsePromise{
+			headerVersion: res.headerVersion(),
+			// Packets will be converted to a ProduceResponse in the responseReceiver goroutine
+			handler: func(packets []byte, err error) {
+				if err != nil {
+					// Failed request
+					cb(nil, err)
+					return
+				}
+
+				if err := versionedDecode(packets, res, request.version()); err != nil {
+					// Malformed response
+					cb(nil, err)
+					return
+				}
+
+				// Wellformed response
+				b.updateThrottleMetric(res.ThrottleTime)
+				cb(res, nil)
+			},
+		}
+	}
+
+	return b.sendWithPromise(request, promise)
 }
 
 //Produce returns a produce response or error
@@ -340,6 +437,7 @@ func (b *Broker) Produce(request *ProduceRequest) (*ProduceResponse, error) {
 	} else {
 		response = new(ProduceResponse)
 		err = b.sendAndReceive(request, response)
+		b.updateThrottleMetric(response.ThrottleTime)
 	}
 
 	if err != nil {
@@ -349,7 +447,7 @@ func (b *Broker) Produce(request *ProduceRequest) (*ProduceResponse, error) {
 	return response, nil
 }
 
-//Fetch returns a FetchResponse or error
+// Fetch returns a FetchResponse or error
 func (b *Broker) Fetch(request *FetchRequest) (*FetchResponse, error) {
 	response := new(FetchResponse)
 
@@ -361,7 +459,7 @@ func (b *Broker) Fetch(request *FetchRequest) (*FetchResponse, error) {
 	return response, nil
 }
 
-//CommitOffset return an Offset commit response or error
+// CommitOffset return an Offset commit response or error
 func (b *Broker) CommitOffset(request *OffsetCommitRequest) (*OffsetCommitResponse, error) {
 	response := new(OffsetCommitResponse)
 
@@ -373,9 +471,10 @@ func (b *Broker) CommitOffset(request *OffsetCommitRequest) (*OffsetCommitRespon
 	return response, nil
 }
 
-//FetchOffset returns an offset fetch response or error
+// FetchOffset returns an offset fetch response or error
 func (b *Broker) FetchOffset(request *OffsetFetchRequest) (*OffsetFetchResponse, error) {
 	response := new(OffsetFetchResponse)
+	response.Version = request.Version // needed to handle the two header versions
 
 	err := b.sendAndReceive(request, response)
 	if err != nil {
@@ -385,7 +484,7 @@ func (b *Broker) FetchOffset(request *OffsetFetchRequest) (*OffsetFetchResponse,
 	return response, nil
 }
 
-//JoinGroup returns a join group response or error
+// JoinGroup returns a join group response or error
 func (b *Broker) JoinGroup(request *JoinGroupRequest) (*JoinGroupResponse, error) {
 	response := new(JoinGroupResponse)
 
@@ -397,7 +496,7 @@ func (b *Broker) JoinGroup(request *JoinGroupRequest) (*JoinGroupResponse, error
 	return response, nil
 }
 
-//SyncGroup returns a sync group response or error
+// SyncGroup returns a sync group response or error
 func (b *Broker) SyncGroup(request *SyncGroupRequest) (*SyncGroupResponse, error) {
 	response := new(SyncGroupResponse)
 
@@ -409,7 +508,7 @@ func (b *Broker) SyncGroup(request *SyncGroupRequest) (*SyncGroupResponse, error
 	return response, nil
 }
 
-//LeaveGroup return a leave group response or error
+// LeaveGroup return a leave group response or error
 func (b *Broker) LeaveGroup(request *LeaveGroupRequest) (*LeaveGroupResponse, error) {
 	response := new(LeaveGroupResponse)
 
@@ -421,7 +520,7 @@ func (b *Broker) LeaveGroup(request *LeaveGroupRequest) (*LeaveGroupResponse, er
 	return response, nil
 }
 
-//Heartbeat returns a heartbeat response or error
+// Heartbeat returns a heartbeat response or error
 func (b *Broker) Heartbeat(request *HeartbeatRequest) (*HeartbeatResponse, error) {
 	response := new(HeartbeatResponse)
 
@@ -433,7 +532,7 @@ func (b *Broker) Heartbeat(request *HeartbeatRequest) (*HeartbeatResponse, error
 	return response, nil
 }
 
-//ListGroups return a list group response or error
+// ListGroups return a list group response or error
 func (b *Broker) ListGroups(request *ListGroupsRequest) (*ListGroupsResponse, error) {
 	response := new(ListGroupsResponse)
 
@@ -445,7 +544,7 @@ func (b *Broker) ListGroups(request *ListGroupsRequest) (*ListGroupsResponse, er
 	return response, nil
 }
 
-//DescribeGroups return describe group response or error
+// DescribeGroups return describe group response or error
 func (b *Broker) DescribeGroups(request *DescribeGroupsRequest) (*DescribeGroupsResponse, error) {
 	response := new(DescribeGroupsResponse)
 
@@ -457,7 +556,7 @@ func (b *Broker) DescribeGroups(request *DescribeGroupsRequest) (*DescribeGroups
 	return response, nil
 }
 
-//ApiVersions return api version response or error
+// ApiVersions return api version response or error
 func (b *Broker) ApiVersions(request *ApiVersionsRequest) (*ApiVersionsResponse, error) {
 	response := new(ApiVersionsResponse)
 
@@ -469,7 +568,7 @@ func (b *Broker) ApiVersions(request *ApiVersionsRequest) (*ApiVersionsResponse,
 	return response, nil
 }
 
-//CreateTopics send a create topic request and returns create topic response
+// CreateTopics send a create topic request and returns create topic response
 func (b *Broker) CreateTopics(request *CreateTopicsRequest) (*CreateTopicsResponse, error) {
 	response := new(CreateTopicsResponse)
 
@@ -481,7 +580,7 @@ func (b *Broker) CreateTopics(request *CreateTopicsRequest) (*CreateTopicsRespon
 	return response, nil
 }
 
-//DeleteTopics sends a delete topic request and returns delete topic response
+// DeleteTopics sends a delete topic request and returns delete topic response
 func (b *Broker) DeleteTopics(request *DeleteTopicsRequest) (*DeleteTopicsResponse, error) {
 	response := new(DeleteTopicsResponse)
 
@@ -493,8 +592,8 @@ func (b *Broker) DeleteTopics(request *DeleteTopicsRequest) (*DeleteTopicsRespon
 	return response, nil
 }
 
-//CreatePartitions sends a create partition request and returns create
-//partitions response or error
+// CreatePartitions sends a create partition request and returns create
+// partitions response or error
 func (b *Broker) CreatePartitions(request *CreatePartitionsRequest) (*CreatePartitionsResponse, error) {
 	response := new(CreatePartitionsResponse)
 
@@ -506,8 +605,8 @@ func (b *Broker) CreatePartitions(request *CreatePartitionsRequest) (*CreatePart
 	return response, nil
 }
 
-//AlterPartitionReassignments sends a alter partition reassignments request and
-//returns alter partition reassignments response
+// AlterPartitionReassignments sends a alter partition reassignments request and
+// returns alter partition reassignments response
 func (b *Broker) AlterPartitionReassignments(request *AlterPartitionReassignmentsRequest) (*AlterPartitionReassignmentsResponse, error) {
 	response := new(AlterPartitionReassignmentsResponse)
 
@@ -519,8 +618,8 @@ func (b *Broker) AlterPartitionReassignments(request *AlterPartitionReassignment
 	return response, nil
 }
 
-//ListPartitionReassignments sends a list partition reassignments request and
-//returns list partition reassignments response
+// ListPartitionReassignments sends a list partition reassignments request and
+// returns list partition reassignments response
 func (b *Broker) ListPartitionReassignments(request *ListPartitionReassignmentsRequest) (*ListPartitionReassignmentsResponse, error) {
 	response := new(ListPartitionReassignmentsResponse)
 
@@ -532,8 +631,8 @@ func (b *Broker) ListPartitionReassignments(request *ListPartitionReassignmentsR
 	return response, nil
 }
 
-//DeleteRecords send a request to delete records and return delete record
-//response or error
+// DeleteRecords send a request to delete records and return delete record
+// response or error
 func (b *Broker) DeleteRecords(request *DeleteRecordsRequest) (*DeleteRecordsResponse, error) {
 	response := new(DeleteRecordsResponse)
 
@@ -545,7 +644,7 @@ func (b *Broker) DeleteRecords(request *DeleteRecordsRequest) (*DeleteRecordsRes
 	return response, nil
 }
 
-//DescribeAcls sends a describe acl request and returns a response or error
+// DescribeAcls sends a describe acl request and returns a response or error
 func (b *Broker) DescribeAcls(request *DescribeAclsRequest) (*DescribeAclsResponse, error) {
 	response := new(DescribeAclsResponse)
 
@@ -557,7 +656,7 @@ func (b *Broker) DescribeAcls(request *DescribeAclsRequest) (*DescribeAclsRespon
 	return response, nil
 }
 
-//CreateAcls sends a create acl request and returns a response or error
+// CreateAcls sends a create acl request and returns a response or error
 func (b *Broker) CreateAcls(request *CreateAclsRequest) (*CreateAclsResponse, error) {
 	response := new(CreateAclsResponse)
 
@@ -569,7 +668,7 @@ func (b *Broker) CreateAcls(request *CreateAclsRequest) (*CreateAclsResponse, er
 	return response, nil
 }
 
-//DeleteAcls sends a delete acl request and returns a response or error
+// DeleteAcls sends a delete acl request and returns a response or error
 func (b *Broker) DeleteAcls(request *DeleteAclsRequest) (*DeleteAclsResponse, error) {
 	response := new(DeleteAclsResponse)
 
@@ -581,7 +680,7 @@ func (b *Broker) DeleteAcls(request *DeleteAclsRequest) (*DeleteAclsResponse, er
 	return response, nil
 }
 
-//InitProducerID sends an init producer request and returns a response or error
+// InitProducerID sends an init producer request and returns a response or error
 func (b *Broker) InitProducerID(request *InitProducerIDRequest) (*InitProducerIDResponse, error) {
 	response := new(InitProducerIDResponse)
 
@@ -593,8 +692,8 @@ func (b *Broker) InitProducerID(request *InitProducerIDRequest) (*InitProducerID
 	return response, nil
 }
 
-//AddPartitionsToTxn send a request to add partition to txn and returns
-//a response or error
+// AddPartitionsToTxn send a request to add partition to txn and returns
+// a response or error
 func (b *Broker) AddPartitionsToTxn(request *AddPartitionsToTxnRequest) (*AddPartitionsToTxnResponse, error) {
 	response := new(AddPartitionsToTxnResponse)
 
@@ -606,8 +705,8 @@ func (b *Broker) AddPartitionsToTxn(request *AddPartitionsToTxnRequest) (*AddPar
 	return response, nil
 }
 
-//AddOffsetsToTxn sends a request to add offsets to txn and returns a response
-//or error
+// AddOffsetsToTxn sends a request to add offsets to txn and returns a response
+// or error
 func (b *Broker) AddOffsetsToTxn(request *AddOffsetsToTxnRequest) (*AddOffsetsToTxnResponse, error) {
 	response := new(AddOffsetsToTxnResponse)
 
@@ -619,7 +718,7 @@ func (b *Broker) AddOffsetsToTxn(request *AddOffsetsToTxnRequest) (*AddOffsetsTo
 	return response, nil
 }
 
-//EndTxn sends a request to end txn and returns a response or error
+// EndTxn sends a request to end txn and returns a response or error
 func (b *Broker) EndTxn(request *EndTxnRequest) (*EndTxnResponse, error) {
 	response := new(EndTxnResponse)
 
@@ -631,8 +730,8 @@ func (b *Broker) EndTxn(request *EndTxnRequest) (*EndTxnResponse, error) {
 	return response, nil
 }
 
-//TxnOffsetCommit sends a request to commit transaction offsets and returns
-//a response or error
+// TxnOffsetCommit sends a request to commit transaction offsets and returns
+// a response or error
 func (b *Broker) TxnOffsetCommit(request *TxnOffsetCommitRequest) (*TxnOffsetCommitResponse, error) {
 	response := new(TxnOffsetCommitResponse)
 
@@ -644,8 +743,8 @@ func (b *Broker) TxnOffsetCommit(request *TxnOffsetCommitRequest) (*TxnOffsetCom
 	return response, nil
 }
 
-//DescribeConfigs sends a request to describe config and returns a response or
-//error
+// DescribeConfigs sends a request to describe config and returns a response or
+// error
 func (b *Broker) DescribeConfigs(request *DescribeConfigsRequest) (*DescribeConfigsResponse, error) {
 	response := new(DescribeConfigsResponse)
 
@@ -657,7 +756,7 @@ func (b *Broker) DescribeConfigs(request *DescribeConfigsRequest) (*DescribeConf
 	return response, nil
 }
 
-//AlterConfigs sends a request to alter config and return a response or error
+// AlterConfigs sends a request to alter config and return a response or error
 func (b *Broker) AlterConfigs(request *AlterConfigsRequest) (*AlterConfigsResponse, error) {
 	response := new(AlterConfigsResponse)
 
@@ -669,7 +768,19 @@ func (b *Broker) AlterConfigs(request *AlterConfigsRequest) (*AlterConfigsRespon
 	return response, nil
 }
 
-//DeleteGroups sends a request to delete groups and returns a response or error
+// IncrementalAlterConfigs sends a request to incremental alter config and return a response or error
+func (b *Broker) IncrementalAlterConfigs(request *IncrementalAlterConfigsRequest) (*IncrementalAlterConfigsResponse, error) {
+	response := new(IncrementalAlterConfigsResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+// DeleteGroups sends a request to delete groups and returns a response or error
 func (b *Broker) DeleteGroups(request *DeleteGroupsRequest) (*DeleteGroupsResponse, error) {
 	response := new(DeleteGroupsResponse)
 
@@ -680,9 +791,67 @@ func (b *Broker) DeleteGroups(request *DeleteGroupsRequest) (*DeleteGroupsRespon
 	return response, nil
 }
 
-//DescribeLogDirs sends a request to get the broker's log dir paths and sizes
+// DeleteOffsets sends a request to delete group offsets and returns a response or error
+func (b *Broker) DeleteOffsets(request *DeleteOffsetsRequest) (*DeleteOffsetsResponse, error) {
+	response := new(DeleteOffsetsResponse)
+
+	if err := b.sendAndReceive(request, response); err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+// DescribeLogDirs sends a request to get the broker's log dir paths and sizes
 func (b *Broker) DescribeLogDirs(request *DescribeLogDirsRequest) (*DescribeLogDirsResponse, error) {
 	response := new(DescribeLogDirsResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+// DescribeUserScramCredentials sends a request to get SCRAM users
+func (b *Broker) DescribeUserScramCredentials(req *DescribeUserScramCredentialsRequest) (*DescribeUserScramCredentialsResponse, error) {
+	res := new(DescribeUserScramCredentialsResponse)
+
+	err := b.sendAndReceive(req, res)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, err
+}
+
+func (b *Broker) AlterUserScramCredentials(req *AlterUserScramCredentialsRequest) (*AlterUserScramCredentialsResponse, error) {
+	res := new(AlterUserScramCredentialsResponse)
+
+	err := b.sendAndReceive(req, res)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
+// DescribeClientQuotas sends a request to get the broker's quotas
+func (b *Broker) DescribeClientQuotas(request *DescribeClientQuotasRequest) (*DescribeClientQuotasResponse, error) {
+	response := new(DescribeClientQuotasResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+// AlterClientQuotas sends a request to alter the broker's quotas
+func (b *Broker) AlterClientQuotas(request *AlterClientQuotasRequest) (*AlterClientQuotasResponse, error) {
+	response := new(AlterClientQuotasResponse)
 
 	err := b.sendAndReceive(request, response)
 	if err != nil {
@@ -713,24 +882,43 @@ func (b *Broker) write(buf []byte) (n int, err error) {
 }
 
 func (b *Broker) send(rb protocolBody, promiseResponse bool, responseHeaderVersion int16) (*responsePromise, error) {
+	var promise *responsePromise
+	if promiseResponse {
+		// Packets or error will be sent to the following channels
+		// once the response is received
+		promise = &responsePromise{
+			headerVersion: responseHeaderVersion,
+			packets:       make(chan []byte),
+			errors:        make(chan error),
+		}
+	}
+
+	if err := b.sendWithPromise(rb, promise); err != nil {
+		return nil, err
+	}
+
+	return promise, nil
+}
+
+func (b *Broker) sendWithPromise(rb protocolBody, promise *responsePromise) error {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
 	if b.conn == nil {
 		if b.connErr != nil {
-			return nil, b.connErr
+			return b.connErr
 		}
-		return nil, ErrNotConnected
+		return ErrNotConnected
 	}
 
 	if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
-		return nil, ErrUnsupportedVersion
+		return ErrUnsupportedVersion
 	}
 
 	req := &request{correlationID: b.correlationID, clientID: b.conf.ClientID, body: rb}
 	buf, err := encode(req, b.conf.MetricRegistry)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	requestTime := time.Now()
@@ -740,20 +928,21 @@ func (b *Broker) send(rb protocolBody, promiseResponse bool, responseHeaderVersi
 	b.updateOutgoingCommunicationMetrics(bytes)
 	if err != nil {
 		b.addRequestInFlightMetrics(-1)
-		return nil, err
+		return err
 	}
 	b.correlationID++
 
-	if !promiseResponse {
+	if promise == nil {
 		// Record request latency without the response
 		b.updateRequestLatencyAndInFlightMetrics(time.Since(requestTime))
-		return nil, nil
+		return nil
 	}
 
-	promise := responsePromise{requestTime, req.correlationID, responseHeaderVersion, make(chan []byte), make(chan error)}
+	promise.requestTime = requestTime
+	promise.correlationID = req.correlationID
 	b.responses <- promise
 
-	return &promise, nil
+	return nil
 }
 
 func (b *Broker) sendAndReceive(req protocolBody, res protocolBody) error {
@@ -816,7 +1005,7 @@ func (b *Broker) encode(pe packetEncoder, version int16) (err error) {
 		return err
 	}
 
-	port, err := strconv.Atoi(portstr)
+	port, err := strconv.ParseInt(portstr, 10, 32)
 	if err != nil {
 		return err
 	}
@@ -848,11 +1037,11 @@ func (b *Broker) responseReceiver() {
 			// This was previously incremented in send() and
 			// we are not calling updateIncomingCommunicationMetrics()
 			b.addRequestInFlightMetrics(-1)
-			response.errors <- dead
+			response.handle(nil, dead)
 			continue
 		}
 
-		var headerLength = getHeaderLength(response.headerVersion)
+		headerLength := getHeaderLength(response.headerVersion)
 		header := make([]byte, headerLength)
 
 		bytesReadHeader, err := b.readFull(header)
@@ -860,7 +1049,7 @@ func (b *Broker) responseReceiver() {
 		if err != nil {
 			b.updateIncomingCommunicationMetrics(bytesReadHeader, requestLatency)
 			dead = err
-			response.errors <- err
+			response.handle(nil, err)
 			continue
 		}
 
@@ -869,7 +1058,7 @@ func (b *Broker) responseReceiver() {
 		if err != nil {
 			b.updateIncomingCommunicationMetrics(bytesReadHeader, requestLatency)
 			dead = err
-			response.errors <- err
+			response.handle(nil, err)
 			continue
 		}
 		if decodedHeader.correlationID != response.correlationID {
@@ -877,7 +1066,7 @@ func (b *Broker) responseReceiver() {
 			// TODO if decoded ID < cur ID, discard until we catch up
 			// TODO if decoded ID > cur ID, save it so when cur ID catches up we have a response
 			dead = PacketDecodingError{fmt.Sprintf("correlation ID didn't match, wanted %d, got %d", response.correlationID, decodedHeader.correlationID)}
-			response.errors <- dead
+			response.handle(nil, dead)
 			continue
 		}
 
@@ -886,11 +1075,11 @@ func (b *Broker) responseReceiver() {
 		b.updateIncomingCommunicationMetrics(bytesReadHeader+bytesReadBody, requestLatency)
 		if err != nil {
 			dead = err
-			response.errors <- err
+			response.handle(nil, err)
 			continue
 		}
 
-		response.packets <- buf
+		response.handle(buf, nil)
 	}
 	close(b.done)
 }
@@ -909,7 +1098,7 @@ func (b *Broker) authenticateViaSASL() error {
 	case SASLTypeOAuth:
 		return b.sendAndReceiveSASLOAuth(b.conf.Net.SASL.TokenProvider)
 	case SASLTypeSCRAMSHA256, SASLTypeSCRAMSHA512:
-		return b.sendAndReceiveSASLSCRAMv1()
+		return b.sendAndReceiveSASLSCRAM()
 	case SASLTypeGSSAPI:
 		return b.sendAndReceiveKerberos()
 	default:
@@ -977,7 +1166,7 @@ func (b *Broker) sendAndReceiveSASLHandshake(saslType SASLMechanism, version int
 		return res.Err
 	}
 
-	Logger.Print("Successful SASL handshake. Available mechanisms: ", res.EnabledMechanisms)
+	DebugLogger.Print("Successful SASL handshake. Available mechanisms: ", res.EnabledMechanisms)
 	return nil
 }
 
@@ -1025,7 +1214,7 @@ func (b *Broker) sendAndReceiveSASLPlainAuth() error {
 // sendAndReceiveV0SASLPlainAuth flows the v0 sasl auth NOT wrapped in the kafka protocol
 func (b *Broker) sendAndReceiveV0SASLPlainAuth() error {
 	length := len(b.conf.Net.SASL.AuthIdentity) + 1 + len(b.conf.Net.SASL.User) + 1 + len(b.conf.Net.SASL.Password)
-	authBytes := make([]byte, length+4) //4 byte length header + auth data
+	authBytes := make([]byte, length+4) // 4 byte length header + auth data
 	binary.BigEndian.PutUint32(authBytes, uint32(length))
 	copy(authBytes[4:], b.conf.Net.SASL.AuthIdentity+"\x00"+b.conf.Net.SASL.User+"\x00"+b.conf.Net.SASL.Password)
 
@@ -1050,7 +1239,7 @@ func (b *Broker) sendAndReceiveV0SASLPlainAuth() error {
 		return err
 	}
 
-	Logger.Printf("SASL authentication successful with broker %s:%v - %v\n", b.addr, n, header)
+	DebugLogger.Printf("SASL authentication successful with broker %s:%v - %v\n", b.addr, n, header)
 	return nil
 }
 
@@ -1148,6 +1337,70 @@ func (b *Broker) sendClientMessage(message []byte) (bool, error) {
 	return isChallenge, err
 }
 
+func (b *Broker) sendAndReceiveSASLSCRAM() error {
+	if b.conf.Net.SASL.Version == SASLHandshakeV0 {
+		return b.sendAndReceiveSASLSCRAMv0()
+	}
+	return b.sendAndReceiveSASLSCRAMv1()
+}
+
+func (b *Broker) sendAndReceiveSASLSCRAMv0() error {
+	if err := b.sendAndReceiveSASLHandshake(b.conf.Net.SASL.Mechanism, SASLHandshakeV0); err != nil {
+		return err
+	}
+
+	scramClient := b.conf.Net.SASL.SCRAMClientGeneratorFunc()
+	if err := scramClient.Begin(b.conf.Net.SASL.User, b.conf.Net.SASL.Password, b.conf.Net.SASL.SCRAMAuthzID); err != nil {
+		return fmt.Errorf("failed to start SCRAM exchange with the server: %s", err.Error())
+	}
+
+	msg, err := scramClient.Step("")
+	if err != nil {
+		return fmt.Errorf("failed to advance the SCRAM exchange: %s", err.Error())
+	}
+
+	for !scramClient.Done() {
+		requestTime := time.Now()
+		// Will be decremented in updateIncomingCommunicationMetrics (except error)
+		b.addRequestInFlightMetrics(1)
+		length := len(msg)
+		authBytes := make([]byte, length+4) //4 byte length header + auth data
+		binary.BigEndian.PutUint32(authBytes, uint32(length))
+		copy(authBytes[4:], []byte(msg))
+		_, err := b.write(authBytes)
+		b.updateOutgoingCommunicationMetrics(length + 4)
+		if err != nil {
+			b.addRequestInFlightMetrics(-1)
+			Logger.Printf("Failed to write SASL auth header to broker %s: %s\n", b.addr, err.Error())
+			return err
+		}
+		b.correlationID++
+		header := make([]byte, 4)
+		_, err = b.readFull(header)
+		if err != nil {
+			b.addRequestInFlightMetrics(-1)
+			Logger.Printf("Failed to read response header while authenticating with SASL to broker %s: %s\n", b.addr, err.Error())
+			return err
+		}
+		payload := make([]byte, int32(binary.BigEndian.Uint32(header)))
+		n, err := b.readFull(payload)
+		if err != nil {
+			b.addRequestInFlightMetrics(-1)
+			Logger.Printf("Failed to read response payload while authenticating with SASL to broker %s: %s\n", b.addr, err.Error())
+			return err
+		}
+		b.updateIncomingCommunicationMetrics(n+4, time.Since(requestTime))
+		msg, err = scramClient.Step(string(payload))
+		if err != nil {
+			Logger.Println("SASL authentication failed", err)
+			return err
+		}
+	}
+
+	DebugLogger.Println("SASL authentication succeeded")
+	return nil
+}
+
 func (b *Broker) sendAndReceiveSASLSCRAMv1() error {
 	if err := b.sendAndReceiveSASLHandshake(b.conf.Net.SASL.Mechanism, SASLHandshakeV1); err != nil {
 		return err
@@ -1192,7 +1445,7 @@ func (b *Broker) sendAndReceiveSASLSCRAMv1() error {
 		}
 	}
 
-	Logger.Println("SASL authentication succeeded")
+	DebugLogger.Println("SASL authentication succeeded")
 	return nil
 }
 
@@ -1387,6 +1640,18 @@ func (b *Broker) updateOutgoingCommunicationMetrics(bytes int) {
 	}
 }
 
+func (b *Broker) updateThrottleMetric(throttleTime time.Duration) {
+	if throttleTime != time.Duration(0) {
+		DebugLogger.Printf(
+			"producer/broker/%d ProduceResponse throttled %v\n",
+			b.ID(), throttleTime)
+		if b.brokerThrottleTime != nil {
+			throttleTimeInMs := int64(throttleTime / time.Millisecond)
+			b.brokerThrottleTime.Update(throttleTimeInMs)
+		}
+	}
+}
+
 func (b *Broker) registerMetrics() {
 	b.brokerIncomingByteRate = b.registerMeter("incoming-byte-rate")
 	b.brokerRequestRate = b.registerMeter("request-rate")
@@ -1396,6 +1661,7 @@ func (b *Broker) registerMetrics() {
 	b.brokerResponseRate = b.registerMeter("response-rate")
 	b.brokerResponseSize = b.registerHistogram("response-size")
 	b.brokerRequestsInFlight = b.registerCounter("requests-in-flight")
+	b.brokerThrottleTime = b.registerHistogram("throttle-time-in-ms")
 }
 
 func (b *Broker) unregisterMetrics() {
@@ -1425,7 +1691,9 @@ func (b *Broker) registerCounter(name string) metrics.Counter {
 
 func validServerNameTLS(addr string, cfg *tls.Config) *tls.Config {
 	if cfg == nil {
-		cfg = &tls.Config{}
+		cfg = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
 	}
 	if cfg.ServerName != "" {
 		return cfg

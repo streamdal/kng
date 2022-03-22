@@ -70,6 +70,12 @@ type ClusterAdmin interface {
 	// for some resources while fail for others. The configs for a particular resource are updated automatically.
 	AlterConfig(resourceType ConfigResourceType, name string, entries map[string]*string, validateOnly bool) error
 
+	// IncrementalAlterConfig Incrementally Update the configuration for the specified resources with the default options.
+	// This operation is supported by brokers with version 2.3.0.0 or higher.
+	// Updates are not transactional so they may succeed for some resources while fail for others.
+	// The configs for a particular resource are updated automatically.
+	IncrementalAlterConfig(resourceType ConfigResourceType, name string, entries map[string]IncrementalAlterConfigsEntry, validateOnly bool) error
+
 	// Creates access control lists (ACLs) which are bound to specific resources.
 	// This operation is not transactional so it may succeed for some ACLs while fail for others.
 	// If you attempt to add an ACL that duplicates an existing ACL, no error will be raised, but
@@ -95,6 +101,9 @@ type ClusterAdmin interface {
 	// List the consumer group offsets available in the cluster.
 	ListConsumerGroupOffsets(group string, topicPartitions map[string][]int32) (*OffsetFetchResponse, error)
 
+	// Deletes a consumer group offset
+	DeleteConsumerGroupOffset(group string, topic string, partition int32) error
+
 	// Delete a consumer group.
 	DeleteConsumerGroup(group string) error
 
@@ -103,6 +112,27 @@ type ClusterAdmin interface {
 
 	// Get information about all log directories on the given set of brokers
 	DescribeLogDirs(brokers []int32) (map[int32][]DescribeLogDirsResponseDirMetadata, error)
+
+	// Get information about SCRAM users
+	DescribeUserScramCredentials(users []string) ([]*DescribeUserScramCredentialsResult, error)
+
+	// Delete SCRAM users
+	DeleteUserScramCredentials(delete []AlterUserScramCredentialsDelete) ([]*AlterUserScramCredentialsResult, error)
+
+	// Upsert SCRAM users
+	UpsertUserScramCredentials(upsert []AlterUserScramCredentialsUpsert) ([]*AlterUserScramCredentialsResult, error)
+
+	// Get client quota configurations corresponding to the specified filter.
+	// This operation is supported by brokers with version 2.6.0.0 or higher.
+	DescribeClientQuotas(components []QuotaFilterComponent, strict bool) ([]DescribeClientQuotasEntry, error)
+
+	// Alters client quota configurations with the specified alterations.
+	// This operation is supported by brokers with version 2.6.0.0 or higher.
+	AlterClientQuotas(entity []QuotaEntityComponent, op ClientQuotasOp, validateOnly bool) error
+
+	// Controller returns the cluster controller broker. It will return a
+	// locally cached value if it's available.
+	Controller() (*Broker, error)
 
 	// Close shuts down the admin and closes underlying client.
 	Close() error
@@ -125,7 +155,7 @@ func NewClusterAdmin(addrs []string, conf *Config) (ClusterAdmin, error) {
 // NewClusterAdminFromClient creates a new ClusterAdmin using the given client.
 // Note that underlying client will also be closed on admin's Close() call.
 func NewClusterAdminFromClient(client Client) (ClusterAdmin, error) {
-	//make sure we can retrieve the controller
+	// make sure we can retrieve the controller
 	_, err := client.Controller()
 	if err != nil {
 		return nil, err
@@ -165,14 +195,14 @@ func isErrNoController(err error) bool {
 }
 
 // retryOnError will repeatedly call the given (error-returning) func in the
-// case that its response is non-nil and retriable (as determined by the
-// provided retriable func) up to the maximum number of tries permitted by
+// case that its response is non-nil and retryable (as determined by the
+// provided retryable func) up to the maximum number of tries permitted by
 // the admin client configuration
-func (ca *clusterAdmin) retryOnError(retriable func(error) bool, fn func() error) error {
+func (ca *clusterAdmin) retryOnError(retryable func(error) bool, fn func() error) error {
 	var err error
 	for attempt := 0; attempt < ca.conf.Admin.Retry.Max; attempt++ {
 		err = fn()
-		if err == nil || !retriable(err) {
+		if err == nil || !retryable(err) {
 			return err
 		}
 		Logger.Printf(
@@ -434,6 +464,7 @@ func (ca *clusterAdmin) CreatePartitions(topic string, count int32, assignment [
 	request := &CreatePartitionsRequest{
 		TopicPartitions: topicPartitions,
 		Timeout:         ca.conf.Admin.Timeout,
+		ValidateOnly:    validateOnly,
 	}
 
 	return ca.retryOnError(isErrNoController, func() error {
@@ -549,11 +580,7 @@ func (ca *clusterAdmin) DeleteRecords(topic string, partitionOffsets map[int32]i
 		if err != nil {
 			return err
 		}
-		if _, ok := partitionPerBroker[broker]; ok {
-			partitionPerBroker[broker] = append(partitionPerBroker[broker], partition)
-		} else {
-			partitionPerBroker[broker] = []int32{partition}
-		}
+		partitionPerBroker[broker] = append(partitionPerBroker[broker], partition)
 	}
 	errs := make([]error, 0)
 	for broker, partitions := range partitionPerBroker {
@@ -587,8 +614,8 @@ func (ca *clusterAdmin) DeleteRecords(topic string, partitionOffsets map[int32]i
 	if len(errs) > 0 {
 		return ErrDeleteRecords{MultiError{&errs}}
 	}
-	//todo since we are dealing with couple of partitions it would be good if we return slice of errors
-	//for each partition instead of one error
+	// todo since we are dealing with couple of partitions it would be good if we return slice of errors
+	// for each partition instead of one error
 	return nil
 }
 
@@ -623,7 +650,11 @@ func (ca *clusterAdmin) DescribeConfig(resource ConfigResource) ([]ConfigEntry, 
 
 	// DescribeConfig of broker/broker logger must be sent to the broker in question
 	if dependsOnSpecificNode(resource) {
-		id, _ := strconv.Atoi(resource.Name)
+		var id int64
+		id, err = strconv.ParseInt(resource.Name, 10, 32)
+		if err != nil {
+			return nil, err
+		}
 		b, err = ca.findBroker(int32(id))
 	} else {
 		b, err = ca.findAnyBroker()
@@ -674,7 +705,11 @@ func (ca *clusterAdmin) AlterConfig(resourceType ConfigResourceType, name string
 
 	// AlterConfig of broker/broker logger must be sent to the broker in question
 	if dependsOnSpecificNode(ConfigResource{Name: name, Type: resourceType}) {
-		id, _ := strconv.Atoi(name)
+		var id int64
+		id, err = strconv.ParseInt(name, 10, 32)
+		if err != nil {
+			return err
+		}
 		b, err = ca.findBroker(int32(id))
 	} else {
 		b, err = ca.findAnyBroker()
@@ -685,6 +720,58 @@ func (ca *clusterAdmin) AlterConfig(resourceType ConfigResourceType, name string
 
 	_ = b.Open(ca.client.Config())
 	rsp, err := b.AlterConfigs(request)
+	if err != nil {
+		return err
+	}
+
+	for _, rspResource := range rsp.Resources {
+		if rspResource.Name == name {
+			if rspResource.ErrorMsg != "" {
+				return errors.New(rspResource.ErrorMsg)
+			}
+			if rspResource.ErrorCode != 0 {
+				return KError(rspResource.ErrorCode)
+			}
+		}
+	}
+	return nil
+}
+
+func (ca *clusterAdmin) IncrementalAlterConfig(resourceType ConfigResourceType, name string, entries map[string]IncrementalAlterConfigsEntry, validateOnly bool) error {
+	var resources []*IncrementalAlterConfigsResource
+	resources = append(resources, &IncrementalAlterConfigsResource{
+		Type:          resourceType,
+		Name:          name,
+		ConfigEntries: entries,
+	})
+
+	request := &IncrementalAlterConfigsRequest{
+		Resources:    resources,
+		ValidateOnly: validateOnly,
+	}
+
+	var (
+		b   *Broker
+		err error
+	)
+
+	// AlterConfig of broker/broker logger must be sent to the broker in question
+	if dependsOnSpecificNode(ConfigResource{Name: name, Type: resourceType}) {
+		var id int64
+		id, err = strconv.ParseInt(name, 10, 32)
+		if err != nil {
+			return err
+		}
+		b, err = ca.findBroker(int32(id))
+	} else {
+		b, err = ca.findAnyBroker()
+	}
+	if err != nil {
+		return err
+	}
+
+	_ = b.Open(ca.client.Config())
+	rsp, err := b.IncrementalAlterConfigs(request)
 	if err != nil {
 		return err
 	}
@@ -861,6 +948,34 @@ func (ca *clusterAdmin) ListConsumerGroupOffsets(group string, topicPartitions m
 	return coordinator.FetchOffset(request)
 }
 
+func (ca *clusterAdmin) DeleteConsumerGroupOffset(group string, topic string, partition int32) error {
+	coordinator, err := ca.client.Coordinator(group)
+	if err != nil {
+		return err
+	}
+
+	request := &DeleteOffsetsRequest{
+		Group: group,
+		partitions: map[string][]int32{
+			topic: {partition},
+		},
+	}
+
+	resp, err := coordinator.DeleteOffsets(request)
+	if err != nil {
+		return err
+	}
+
+	if resp.ErrorCode != ErrNoError {
+		return resp.ErrorCode
+	}
+
+	if resp.Errors[topic][partition] != ErrNoError {
+		return resp.Errors[topic][partition]
+	}
+	return nil
+}
+
 func (ca *clusterAdmin) DeleteConsumerGroup(group string) error {
 	coordinator, err := ca.client.Coordinator(group)
 	if err != nil {
@@ -931,4 +1046,124 @@ func (ca *clusterAdmin) DescribeLogDirs(brokerIds []int32) (allLogDirs map[int32
 	// Intentionally return only the first error for simplicity
 	err = <-errChan
 	return
+}
+
+func (ca *clusterAdmin) DescribeUserScramCredentials(users []string) ([]*DescribeUserScramCredentialsResult, error) {
+	req := &DescribeUserScramCredentialsRequest{}
+	for _, u := range users {
+		req.DescribeUsers = append(req.DescribeUsers, DescribeUserScramCredentialsRequestUser{
+			Name: u,
+		})
+	}
+
+	b, err := ca.Controller()
+	if err != nil {
+		return nil, err
+	}
+
+	rsp, err := b.DescribeUserScramCredentials(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return rsp.Results, nil
+}
+
+func (ca *clusterAdmin) UpsertUserScramCredentials(upsert []AlterUserScramCredentialsUpsert) ([]*AlterUserScramCredentialsResult, error) {
+	res, err := ca.AlterUserScramCredentials(upsert, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
+func (ca *clusterAdmin) DeleteUserScramCredentials(delete []AlterUserScramCredentialsDelete) ([]*AlterUserScramCredentialsResult, error) {
+	res, err := ca.AlterUserScramCredentials(nil, delete)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
+func (ca *clusterAdmin) AlterUserScramCredentials(u []AlterUserScramCredentialsUpsert, d []AlterUserScramCredentialsDelete) ([]*AlterUserScramCredentialsResult, error) {
+	req := &AlterUserScramCredentialsRequest{
+		Deletions:  d,
+		Upsertions: u,
+	}
+
+	b, err := ca.Controller()
+	if err != nil {
+		return nil, err
+	}
+
+	rsp, err := b.AlterUserScramCredentials(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return rsp.Results, nil
+}
+
+// Describe All : use an empty/nil components slice + strict = false
+// Contains components: strict = false
+// Contains only components: strict = true
+func (ca *clusterAdmin) DescribeClientQuotas(components []QuotaFilterComponent, strict bool) ([]DescribeClientQuotasEntry, error) {
+	request := &DescribeClientQuotasRequest{
+		Components: components,
+		Strict:     strict,
+	}
+
+	b, err := ca.Controller()
+	if err != nil {
+		return nil, err
+	}
+
+	rsp, err := b.DescribeClientQuotas(request)
+	if err != nil {
+		return nil, err
+	}
+
+	if rsp.ErrorMsg != nil && len(*rsp.ErrorMsg) > 0 {
+		return nil, errors.New(*rsp.ErrorMsg)
+	}
+	if rsp.ErrorCode != ErrNoError {
+		return nil, rsp.ErrorCode
+	}
+
+	return rsp.Entries, nil
+}
+
+func (ca *clusterAdmin) AlterClientQuotas(entity []QuotaEntityComponent, op ClientQuotasOp, validateOnly bool) error {
+	entry := AlterClientQuotasEntry{
+		Entity: entity,
+		Ops:    []ClientQuotasOp{op},
+	}
+
+	request := &AlterClientQuotasRequest{
+		Entries:      []AlterClientQuotasEntry{entry},
+		ValidateOnly: validateOnly,
+	}
+
+	b, err := ca.Controller()
+	if err != nil {
+		return err
+	}
+
+	rsp, err := b.AlterClientQuotas(request)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range rsp.Entries {
+		if entry.ErrorMsg != nil && len(*entry.ErrorMsg) > 0 {
+			return errors.New(*entry.ErrorMsg)
+		}
+		if entry.ErrorCode != ErrNoError {
+			return entry.ErrorCode
+		}
+	}
+
+	return nil
 }
