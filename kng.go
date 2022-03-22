@@ -654,6 +654,7 @@ func dialKafka(ctx context.Context, dialer *kafka.Dialer, brokers []string) (*ka
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			logrus.Errorf("unable to dial '%s': %s", addr, err)
+			continue
 		}
 
 		return conn, nil
