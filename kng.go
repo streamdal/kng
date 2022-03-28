@@ -351,21 +351,29 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 		reqConfigs = append(reqConfigs, reqConfig)
 	}
 
+	adm, err := k.getKgoAdmin()
+	if err != nil {
+		return errors.Wrap(err, "unable to instantiate kgo admin client")
+	}
+
+	// Required to get broker list if no call has been made yet which returns metadata
+	adm.Metadata(ctx)
+
+	brokers, err := adm.ListBrokers(ctx)
+	if err != nil {
+		return errors.Wrap(err, "unable to get broker list")
+	}
+
+	if len(brokers) == 1 {
+		k.Options.ReplicationFactor = 1
+		k.Options.NumPartitionsPerTopic = 1
+	}
+
 	reqTopic := kmsg.NewCreateTopicsRequestTopic()
 	reqTopic.Topic = topic
 	reqTopic.Configs = reqConfigs
 	reqTopic.ReplicationFactor = int16(k.Options.ReplicationFactor)
 	reqTopic.NumPartitions = int32(k.Options.NumPartitionsPerTopic)
-
-	println("REPLICATION FACTOR: ", k.Options.ReplicationFactor)
-
-	// TODO: how to get broker list from server?
-	//if len(brokers) == 1 {
-	//	k.Options.ReplicationFactor = 1
-	//	k.Options.NumPartitionsPerTopic = 1
-	//}
-
-	req.Topics = append(req.Topics, reqTopic)
 
 	resp, err := req.RequestWith(context.Background(), cl)
 	if err != nil {
