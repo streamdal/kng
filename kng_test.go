@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/Shopify/sarama"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
@@ -26,7 +27,6 @@ var _ = Describe("kng", func() {
 			Brokers:                kafkaBrokers,
 			ServiceShutdownContext: context.Background(),
 			MainShutdownFunc:       func() {},
-			ReplicationFactor:      1,
 		})
 
 		Expect(err).ToNot(HaveOccurred())
@@ -36,11 +36,15 @@ var _ = Describe("kng", func() {
 	Context("CreateTopic", func() {
 		It("should work", func() {
 			topic := uuid.NewV4().String()
-			// Verify that topic does not exist
-			topics, err := k.ListTopics(context.Background())
 
+			// Verify that topic does not exist (need to use sarama, since
+			// kafka-go doesn't have the functionality
+			clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, sarama.NewConfig())
 			Expect(err).ToNot(HaveOccurred())
-			Expect(topics).ToNot(BeNil())
+			Expect(clusterAdmin).ToNot(BeNil())
+
+			topics, err := clusterAdmin.ListTopics()
+			Expect(err).ToNot(HaveOccurred())
 
 			_, ok := topics[topic]
 			Expect(ok).To(BeFalse())
@@ -53,7 +57,7 @@ var _ = Describe("kng", func() {
 			time.Sleep(time.Second)
 
 			// Verify that the topic now exists
-			topics, err = k.ListTopics(context.Background())
+			topics, err = clusterAdmin.ListTopics()
 			Expect(err).ToNot(HaveOccurred())
 
 			_, ok = topics[topic]
@@ -65,10 +69,14 @@ var _ = Describe("kng", func() {
 		It("should work", func() {
 			topic := uuid.NewV4().String()
 
-			// Verify that topic does not exist
-			topics, err := k.ListTopics(context.Background())
+			// Verify that topic does not exist (need to use sarama, since
+			// kafka-go doesn't have the functionality
+			clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, sarama.NewConfig())
 			Expect(err).ToNot(HaveOccurred())
-			Expect(topics).ToNot(BeNil())
+			Expect(clusterAdmin).ToNot(BeNil())
+
+			topics, err := clusterAdmin.ListTopics()
+			Expect(err).ToNot(HaveOccurred())
 
 			_, ok := topics[topic]
 			Expect(ok).To(BeFalse())
@@ -81,7 +89,7 @@ var _ = Describe("kng", func() {
 			time.Sleep(time.Second)
 
 			// Verify topic is created
-			topics, err = k.ListTopics(context.Background())
+			topics, err = clusterAdmin.ListTopics()
 			Expect(err).ToNot(HaveOccurred())
 
 			_, ok = topics[topic]
@@ -95,7 +103,7 @@ var _ = Describe("kng", func() {
 			time.Sleep(time.Second)
 
 			// Verify its deleted
-			topics, err = k.ListTopics(context.Background())
+			topics, err = clusterAdmin.ListTopics()
 			Expect(err).ToNot(HaveOccurred())
 
 			_, ok = topics[topic]
@@ -108,7 +116,7 @@ var _ = Describe("kng", func() {
 			topic := uuid.NewV4().String()
 			testData := []byte("testData")
 
-			err := k.CreateTopic(context.Background(), topic)
+			err := createTopic(k.Options.Brokers, topic)
 			Expect(err).ToNot(HaveOccurred())
 
 			k.Publish(ctx, topic, testData)
@@ -128,7 +136,7 @@ var _ = Describe("kng", func() {
 			testData := []byte("testData")
 
 			// Create temp topic
-			err := k.CreateTopic(ctx, topic)
+			err := createTopic(k.Options.Brokers, topic)
 			Expect(err).ToNot(HaveOccurred())
 
 			// Give kafka a second to catch up
@@ -230,6 +238,25 @@ func write(brokers []string, topic string, data []byte) error {
 	}); err != nil {
 		return errors.Wrap(err, "unable to write message")
 	}
+
+	return nil
+}
+
+func createTopic(brokers []string, topic string) error {
+	clusterAdmin, err := sarama.NewClusterAdmin(brokers, sarama.NewConfig())
+	if err != nil {
+		return errors.Wrap(err, "unable to establish cluster admin conn")
+	}
+
+	if err := clusterAdmin.CreateTopic(topic, &sarama.TopicDetail{
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	}, false); err != nil {
+		return errors.Wrap(err, "unable to create topic")
+	}
+
+	// Give kafka enough time to catch up
+	time.Sleep(time.Second)
 
 	return nil
 }
