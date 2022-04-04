@@ -50,12 +50,13 @@ type IReader interface {
 }
 
 type Kafka struct {
-	Dialer         *kafka.Dialer
-	Writer         *kafka.Writer
-	PublisherMap   map[string]*Publisher
-	PublisherMutex *sync.RWMutex
-	Options        *Options
-	log            *logrus.Entry
+	Dialer             *kafka.Dialer
+	Writer             *kafka.Writer
+	PublisherMap       map[string]*Publisher
+	PublisherMutex     *sync.RWMutex
+	Options            *Options
+	initialBrokerCheck bool
+	log                *logrus.Entry
 
 	// ServiceShutdownContext is used by main() to shutdown services before application termination
 	ServiceShutdownContext context.Context
@@ -310,17 +311,9 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 		return err
 	}
 
-	brokers, _, err := clusterAdmin.DescribeCluster()
-	if err != nil {
-		err = errors.Wrap(err, "could not get broker list")
+	if err := k.sanityCheckPartitions(clusterAdmin); err != nil {
 		span.SetTag("error", err)
 		return err
-	}
-
-	// If local, we do not want to overload kafka - use sensible settings
-	if len(brokers) == 1 {
-		k.Options.ReplicationFactor = 1
-		k.Options.NumPartitionsPerTopic = 1
 	}
 
 	opts := &sarama.TopicDetail{
@@ -333,6 +326,31 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 		span.SetTag("error", err)
 		return err
 	}
+
+	return nil
+}
+
+// sanityCheckPartitions overrides replica and partition configs when running with only one broker, aka local docker
+func (k *Kafka) sanityCheckPartitions(clusterAdmin sarama.ClusterAdmin) error {
+	// Only perform this check once in attempt to avoid "Request exceeded the user-specified time limit in the request"
+	// error when creating a large amount of topics at once. This error is caused by frequent metadata requests slowing
+	// things down.
+	if k.initialBrokerCheck {
+		return nil
+	}
+
+	brokers, _, err := clusterAdmin.DescribeCluster()
+	if err != nil {
+		return errors.Wrap(err, "could not get broker list")
+	}
+
+	// If local, we do not want to overload kafka - use sensible settings
+	if len(brokers) == 1 {
+		k.Options.ReplicationFactor = 1
+		k.Options.NumPartitionsPerTopic = 1
+	}
+
+	k.initialBrokerCheck = true
 
 	return nil
 }
