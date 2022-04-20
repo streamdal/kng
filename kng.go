@@ -106,8 +106,9 @@ type Options struct {
 	Password string
 
 	// Consumer specific settings
-	ReaderMaxWait       time.Duration
-	ReaderUseLastOffset bool
+	ReaderMaxWait        time.Duration
+	ReaderUseLastOffset  bool
+	ReaderUseFirstOffset bool
 
 	// Producer specific settings
 	NumPartitionsPerTopic int
@@ -245,6 +246,8 @@ func (k *Kafka) NewReader(id, groupID, topic string) *Reader {
 
 	if k.Options.ReaderUseLastOffset {
 		readerConfig.StartOffset = kafka.LastOffset
+	} else if k.Options.ReaderUseFirstOffset {
+		readerConfig.StartOffset = kafka.FirstOffset
 	}
 
 	return &Reader{
