@@ -248,15 +248,6 @@ func (d *decoder) readBytes() []byte {
 	}
 }
 
-func (d *decoder) readBytesTo(w io.Writer) bool {
-	if n := d.readInt32(); n < 0 {
-		return false
-	} else {
-		d.writeTo(w, int(n))
-		return d.err == nil
-	}
-}
-
 func (d *decoder) readVarBytes() []byte {
 	if n := d.readVarInt(); n < 0 {
 		return nil
@@ -265,29 +256,11 @@ func (d *decoder) readVarBytes() []byte {
 	}
 }
 
-func (d *decoder) readVarBytesTo(w io.Writer) bool {
-	if n := d.readVarInt(); n < 0 {
-		return false
-	} else {
-		d.writeTo(w, int(n))
-		return d.err == nil
-	}
-}
-
 func (d *decoder) readCompactBytes() []byte {
 	if n := d.readUnsignedVarInt(); n < 1 {
 		return nil
 	} else {
 		return d.read(int(n - 1))
-	}
-}
-
-func (d *decoder) readCompactBytesTo(w io.Writer) bool {
-	if n := d.readUnsignedVarInt(); n < 1 {
-		return false
-	} else {
-		d.writeTo(w, int(n-1))
-		return d.err == nil
 	}
 }
 
@@ -498,8 +471,9 @@ func readInt64(b []byte) int64 {
 
 func Unmarshal(data []byte, version int16, value interface{}) error {
 	typ := elemTypeOf(value)
-	cache, _ := unmarshalers.Load().(map[_type]decodeFunc)
-	decode := cache[typ]
+	cache, _ := unmarshalers.Load().(map[versionedType]decodeFunc)
+	key := versionedType{typ: typ, version: version}
+	decode := cache[key]
 
 	if decode == nil {
 		decode = decodeFuncOf(reflect.TypeOf(value).Elem(), version, false, structTag{
@@ -510,8 +484,8 @@ func Unmarshal(data []byte, version int16, value interface{}) error {
 			Nullable:   true,
 		})
 
-		newCache := make(map[_type]decodeFunc, len(cache)+1)
-		newCache[typ] = decode
+		newCache := make(map[versionedType]decodeFunc, len(cache)+1)
+		newCache[key] = decode
 
 		for typ, fun := range cache {
 			newCache[typ] = fun
@@ -541,5 +515,5 @@ func Unmarshal(data []byte, version int16, value interface{}) error {
 
 var (
 	decoders     sync.Pool    // *decoder
-	unmarshalers atomic.Value // map[_type]decodeFunc
+	unmarshalers atomic.Value // map[versionedType]decodeFunc
 )

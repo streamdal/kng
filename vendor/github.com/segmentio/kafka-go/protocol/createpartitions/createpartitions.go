@@ -7,7 +7,7 @@ func init() {
 }
 
 // Detailed API definition: https://kafka.apache.org/protocol#The_Messages_CreatePartitions.
-// TODO: Support version 2
+// TODO: Support version 2.
 type Request struct {
 	Topics       []RequestTopic `kafka:"min=v0,max=v1"`
 	TimeoutMs    int32          `kafka:"min=v0,max=v1"`
@@ -23,7 +23,7 @@ func (r *Request) Broker(cluster protocol.Cluster) (protocol.Broker, error) {
 type RequestTopic struct {
 	Name        string              `kafka:"min=v0,max=v1"`
 	Count       int32               `kafka:"min=v0,max=v1"`
-	Assignments []RequestAssignment `kafka:"min=v0,max=v1"`
+	Assignments []RequestAssignment `kafka:"min=v0,max=v1,nullable"`
 }
 
 type RequestAssignment struct {
@@ -43,6 +43,4 @@ type ResponseResult struct {
 	ErrorMessage string `kafka:"min=v0,max=v1,nullable"`
 }
 
-var (
-	_ protocol.BrokerMessage = (*Request)(nil)
-)
+var _ protocol.BrokerMessage = (*Request)(nil)

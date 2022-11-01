@@ -1,15 +1,13 @@
 module github.com/segmentio/kafka-go
 
-go 1.13
+go 1.15
 
 require (
-	github.com/eapache/go-xerial-snappy v0.0.0-20180814174437-776d5712da21
-	github.com/golang/snappy v0.0.1
-	github.com/klauspost/compress v1.9.8
-	github.com/pierrec/lz4 v2.0.5+incompatible
-	github.com/stretchr/testify v1.6.1
-	github.com/xdg/scram v0.0.0-20180814205039-7eeb5667e42c
-	github.com/xdg/stringprep v1.0.0 // indirect
-	golang.org/x/crypto v0.0.0-20190506204251-e1dfcc566284 // indirect
-	golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3
+	github.com/klauspost/compress v1.15.9
+	github.com/pierrec/lz4/v4 v4.1.15
+	github.com/stretchr/testify v1.8.0
+	github.com/xdg/scram v1.0.5
+	github.com/xdg/stringprep v1.0.3 // indirect
+	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d // indirect
+	golang.org/x/net v0.0.0-20220706163947-c90051bbdb60
 )

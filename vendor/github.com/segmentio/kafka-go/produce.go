@@ -3,9 +3,11 @@ package kafka
 import (
 	"bufio"
 	"context"
+	"encoding"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/segmentio/kafka-go/protocol"
@@ -32,6 +34,34 @@ func (acks RequiredAcks) String() string {
 		return "unknown"
 	}
 }
+
+func (acks RequiredAcks) MarshalText() ([]byte, error) {
+	return []byte(acks.String()), nil
+}
+
+func (acks *RequiredAcks) UnmarshalText(b []byte) error {
+	switch string(b) {
+	case "none":
+		*acks = RequireNone
+	case "one":
+		*acks = RequireOne
+	case "all":
+		*acks = RequireAll
+	default:
+		x, err := strconv.ParseInt(string(b), 10, 64)
+		parsed := RequiredAcks(x)
+		if err != nil || (parsed != RequireNone && parsed != RequireOne && parsed != RequireAll) {
+			return fmt.Errorf("required acks must be one of none, one, or all, not %q", b)
+		}
+		*acks = parsed
+	}
+	return nil
+}
+
+var (
+	_ encoding.TextMarshaler   = RequiredAcks(0)
+	_ encoding.TextUnmarshaler = (*RequiredAcks)(nil)
+)
 
 // ProduceRequest represents a request sent to a kafka broker to produce records
 // to a topic partition.
@@ -217,35 +247,6 @@ func (p produceRequestPartitionV2) writeTo(wb *writeBuffer) {
 	wb.writeInt32(p.Partition)
 	wb.writeInt32(p.MessageSetSize)
 	p.MessageSet.writeTo(wb)
-}
-
-type produceResponseV2 struct {
-	ThrottleTime int32
-	Topics       []produceResponseTopicV2
-}
-
-func (r produceResponseV2) size() int32 {
-	return 4 + sizeofArray(len(r.Topics), func(i int) int32 { return r.Topics[i].size() })
-}
-
-func (r produceResponseV2) writeTo(wb *writeBuffer) {
-	wb.writeInt32(r.ThrottleTime)
-	wb.writeArray(len(r.Topics), func(i int) { r.Topics[i].writeTo(wb) })
-}
-
-type produceResponseTopicV2 struct {
-	TopicName  string
-	Partitions []produceResponsePartitionV2
-}
-
-func (t produceResponseTopicV2) size() int32 {
-	return sizeofString(t.TopicName) +
-		sizeofArray(len(t.Partitions), func(i int) int32 { return t.Partitions[i].size() })
-}
-
-func (t produceResponseTopicV2) writeTo(wb *writeBuffer) {
-	wb.writeString(t.TopicName)
-	wb.writeArray(len(t.Partitions), func(i int) { t.Partitions[i].writeTo(wb) })
 }
 
 type produceResponsePartitionV2 struct {
