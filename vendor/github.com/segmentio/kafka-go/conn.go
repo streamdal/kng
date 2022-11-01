@@ -53,6 +53,8 @@ type Conn struct {
 	partition     int32
 	fetchMaxBytes int32
 	fetchMinSize  int32
+	broker        int32
+	rack          string
 
 	// correlation ID generator (synchronized on wlock)
 	correlationID int32
@@ -87,6 +89,8 @@ type ConnConfig struct {
 	ClientID  string
 	Topic     string
 	Partition int
+	Broker    int
+	Rack      string
 
 	// The transactional id to use for transactional delivery. Idempotent
 	// deliver should be enabled if transactional id is configured.
@@ -129,16 +133,15 @@ const (
 	ReadCommitted   IsolationLevel = 1
 )
 
-var (
-	// DefaultClientID is the default value used as ClientID of kafka
-	// connections.
-	DefaultClientID string
-)
+// DefaultClientID is the default value used as ClientID of kafka
+// connections.
+var DefaultClientID string
 
 func init() {
 	progname := filepath.Base(os.Args[0])
 	hostname, _ := os.Hostname()
 	DefaultClientID = fmt.Sprintf("%s@%s (github.com/segmentio/kafka-go)", progname, hostname)
+	DefaultTransport.(*Transport).ClientID = DefaultClientID
 }
 
 // NewConn returns a new kafka connection for the given topic and partition.
@@ -174,6 +177,8 @@ func NewConnWith(conn net.Conn, config ConnConfig) *Conn {
 		clientID:        config.ClientID,
 		topic:           config.Topic,
 		partition:       int32(config.Partition),
+		broker:          int32(config.Broker),
+		rack:            config.Rack,
 		offset:          FirstOffset,
 		requiredAcks:    -1,
 		transactionalID: emptyToNullable(config.TransactionalID),
@@ -230,7 +235,20 @@ func (c *Conn) loadVersions() (apiVersionMap, error) {
 	return v, nil
 }
 
-// Controller requests kafka for the current controller and returns its URL
+// Broker returns a Broker value representing the kafka broker that this
+// connection was established to.
+func (c *Conn) Broker() Broker {
+	addr := c.conn.RemoteAddr()
+	host, port, _ := splitHostPortNumber(addr.String())
+	return Broker{
+		Host: host,
+		Port: port,
+		ID:   int(c.broker),
+		Rack: c.rack,
+	}
+}
+
+// Controller requests kafka for the current controller and returns its URL.
 func (c *Conn) Controller() (broker Broker, err error) {
 	err = c.readOperation(
 		func(deadline time.Time, id int32) error {
@@ -244,10 +262,12 @@ func (c *Conn) Controller() (broker Broker, err error) {
 			}
 			for _, brokerMeta := range res.Brokers {
 				if brokerMeta.NodeID == res.ControllerID {
-					broker = Broker{ID: int(brokerMeta.NodeID),
+					broker = Broker{
+						ID:   int(brokerMeta.NodeID),
 						Port: int(brokerMeta.Port),
 						Host: brokerMeta.Host,
-						Rack: brokerMeta.Rack}
+						Rack: brokerMeta.Rack,
+					}
 					break
 				}
 			}
@@ -257,7 +277,7 @@ func (c *Conn) Controller() (broker Broker, err error) {
 	return broker, err
 }
 
-// Brokers retrieve the broker list from the Kafka metadata
+// Brokers retrieve the broker list from the Kafka metadata.
 func (c *Conn) Brokers() ([]Broker, error) {
 	var brokers []Broker
 	err := c.readOperation(
@@ -294,34 +314,6 @@ func (c *Conn) DeleteTopics(topics ...string) error {
 	return err
 }
 
-// describeGroups retrieves the specified groups
-//
-// See http://kafka.apache.org/protocol.html#The_Messages_DescribeGroups
-func (c *Conn) describeGroups(request describeGroupsRequestV0) (describeGroupsResponseV0, error) {
-	var response describeGroupsResponseV0
-
-	err := c.readOperation(
-		func(deadline time.Time, id int32) error {
-			return c.writeRequest(describeGroups, v0, id, request)
-		},
-		func(deadline time.Time, size int) error {
-			return expectZeroSize(func() (remain int, err error) {
-				return (&response).readFrom(&c.rbuf, size)
-			}())
-		},
-	)
-	if err != nil {
-		return describeGroupsResponseV0{}, err
-	}
-	for _, group := range response.Groups {
-		if group.ErrorCode != 0 {
-			return describeGroupsResponseV0{}, Error(group.ErrorCode)
-		}
-	}
-
-	return response, nil
-}
-
 // findCoordinator finds the coordinator for the specified group or transaction
 //
 // See http://kafka.apache.org/protocol.html#The_Messages_FindCoordinator
@@ -331,7 +323,6 @@ func (c *Conn) findCoordinator(request findCoordinatorRequestV0) (findCoordinato
 	err := c.readOperation(
 		func(deadline time.Time, id int32) error {
 			return c.writeRequest(findCoordinator, v0, id, request)
-
 		},
 		func(deadline time.Time, size int) error {
 			return expectZeroSize(func() (remain int, err error) {
@@ -344,32 +335,6 @@ func (c *Conn) findCoordinator(request findCoordinatorRequestV0) (findCoordinato
 	}
 	if response.ErrorCode != 0 {
 		return findCoordinatorResponseV0{}, Error(response.ErrorCode)
-	}
-
-	return response, nil
-}
-
-// heartbeat sends a heartbeat message required by consumer groups
-//
-// See http://kafka.apache.org/protocol.html#The_Messages_Heartbeat
-func (c *Conn) heartbeat(request heartbeatRequestV0) (heartbeatResponseV0, error) {
-	var response heartbeatResponseV0
-
-	err := c.writeOperation(
-		func(deadline time.Time, id int32) error {
-			return c.writeRequest(heartbeat, v0, id, request)
-		},
-		func(deadline time.Time, size int) error {
-			return expectZeroSize(func() (remain int, err error) {
-				return (&response).readFrom(&c.rbuf, size)
-			}())
-		},
-	)
-	if err != nil {
-		return heartbeatResponseV0{}, err
-	}
-	if response.ErrorCode != 0 {
-		return heartbeatResponseV0{}, Error(response.ErrorCode)
 	}
 
 	return response, nil
@@ -761,9 +726,8 @@ func (c *Conn) ReadBatch(minBytes, maxBytes int) *Batch {
 // ReadBatchWith in every way is similar to ReadBatch. ReadBatch is configured
 // with the default values in ReadBatchConfig except for minBytes and maxBytes.
 func (c *Conn) ReadBatchWith(cfg ReadBatchConfig) *Batch {
-
 	var adjustedDeadline time.Time
-	var maxFetch = int(c.fetchMaxBytes)
+	maxFetch := int(c.fetchMaxBytes)
 
 	if cfg.MinBytes < 0 || cfg.MinBytes > maxFetch {
 		return &Batch{err: fmt.Errorf("kafka.(*Conn).ReadBatch: minBytes of %d out of [1,%d] bounds", cfg.MinBytes, maxFetch)}
@@ -862,7 +826,7 @@ func (c *Conn) ReadBatchWith(cfg ReadBatchConfig) *Batch {
 	default:
 		throttle, highWaterMark, remain, err = readFetchResponseHeaderV2(&c.rbuf, size)
 	}
-	if err == errShortRead {
+	if errors.Is(err, errShortRead) {
 		err = checkTimeoutErr(adjustedDeadline)
 	}
 
@@ -874,9 +838,10 @@ func (c *Conn) ReadBatchWith(cfg ReadBatchConfig) *Batch {
 			msgs, err = newMessageSetReader(&c.rbuf, remain)
 		}
 	}
-	if err == errShortRead {
+	if errors.Is(err, errShortRead) {
 		err = checkTimeoutErr(adjustedDeadline)
 	}
+
 	return &Batch{
 		conn:          c,
 		msgs:          msgs,
@@ -968,7 +933,6 @@ func (c *Conn) readOffset(t int64) (offset int64, err error) {
 // connection. If there are none, the method fetches all partitions of the kafka
 // cluster.
 func (c *Conn) ReadPartitions(topics ...string) (partitions []Partition, err error) {
-
 	if len(topics) == 0 {
 		if len(c.topic) != 0 {
 			defaultTopics := [...]string{c.topic}
@@ -979,57 +943,118 @@ func (c *Conn) ReadPartitions(topics ...string) (partitions []Partition, err err
 			topics = nil
 		}
 	}
+	metadataVersion, err := c.negotiateVersion(metadata, v1, v6)
+	if err != nil {
+		return nil, err
+	}
 
 	err = c.readOperation(
 		func(deadline time.Time, id int32) error {
-			return c.writeRequest(metadata, v1, id, topicMetadataRequestV1(topics))
+			switch metadataVersion {
+			case v6:
+				return c.writeRequest(metadata, v6, id, topicMetadataRequestV6{Topics: topics, AllowAutoTopicCreation: true})
+			default:
+				return c.writeRequest(metadata, v1, id, topicMetadataRequestV1(topics))
+			}
 		},
 		func(deadline time.Time, size int) error {
-			var res metadataResponseV1
-
-			if err := c.readResponse(size, &res); err != nil {
-				return err
-			}
-
-			brokers := make(map[int32]Broker, len(res.Brokers))
-			for _, b := range res.Brokers {
-				brokers[b.NodeID] = Broker{
-					Host: b.Host,
-					Port: int(b.Port),
-					ID:   int(b.NodeID),
-					Rack: b.Rack,
-				}
-			}
-
-			makeBrokers := func(ids ...int32) []Broker {
-				b := make([]Broker, len(ids))
-				for i, id := range ids {
-					b[i] = brokers[id]
-				}
-				return b
-			}
-
-			for _, t := range res.Topics {
-				if t.TopicErrorCode != 0 && (c.topic == "" || t.TopicName == c.topic) {
-					// We only report errors if they happened for the topic of
-					// the connection, otherwise the topic will simply have no
-					// partitions in the result set.
-					return Error(t.TopicErrorCode)
-				}
-				for _, p := range t.Partitions {
-					partitions = append(partitions, Partition{
-						Topic:    t.TopicName,
-						Leader:   brokers[p.Leader],
-						Replicas: makeBrokers(p.Replicas...),
-						Isr:      makeBrokers(p.Isr...),
-						ID:       int(p.PartitionID),
-					})
-				}
-			}
-			return nil
+			partitions, err = c.readPartitionsResponse(metadataVersion, size)
+			return err
 		},
 	)
 	return
+}
+
+func (c *Conn) readPartitionsResponse(metadataVersion apiVersion, size int) ([]Partition, error) {
+	switch metadataVersion {
+	case v6:
+		var res metadataResponseV6
+		if err := c.readResponse(size, &res); err != nil {
+			return nil, err
+		}
+		brokers := readBrokerMetadata(res.Brokers)
+		return c.readTopicMetadatav6(brokers, res.Topics)
+	default:
+		var res metadataResponseV1
+		if err := c.readResponse(size, &res); err != nil {
+			return nil, err
+		}
+		brokers := readBrokerMetadata(res.Brokers)
+		return c.readTopicMetadatav1(brokers, res.Topics)
+	}
+}
+
+func readBrokerMetadata(brokerMetadata []brokerMetadataV1) map[int32]Broker {
+	brokers := make(map[int32]Broker, len(brokerMetadata))
+	for _, b := range brokerMetadata {
+		brokers[b.NodeID] = Broker{
+			Host: b.Host,
+			Port: int(b.Port),
+			ID:   int(b.NodeID),
+			Rack: b.Rack,
+		}
+	}
+	return brokers
+}
+
+func (c *Conn) readTopicMetadatav1(brokers map[int32]Broker, topicMetadata []topicMetadataV1) (partitions []Partition, err error) {
+	for _, t := range topicMetadata {
+		if t.TopicErrorCode != 0 && (c.topic == "" || t.TopicName == c.topic) {
+			// We only report errors if they happened for the topic of
+			// the connection, otherwise the topic will simply have no
+			// partitions in the result set.
+			return nil, Error(t.TopicErrorCode)
+		}
+		for _, p := range t.Partitions {
+			partitions = append(partitions, Partition{
+				Topic:           t.TopicName,
+				Leader:          brokers[p.Leader],
+				Replicas:        makeBrokers(brokers, p.Replicas...),
+				Isr:             makeBrokers(brokers, p.Isr...),
+				ID:              int(p.PartitionID),
+				OfflineReplicas: []Broker{},
+			})
+		}
+	}
+	return
+}
+
+func (c *Conn) readTopicMetadatav6(brokers map[int32]Broker, topicMetadata []topicMetadataV6) (partitions []Partition, err error) {
+	for _, t := range topicMetadata {
+		if t.TopicErrorCode != 0 && (c.topic == "" || t.TopicName == c.topic) {
+			// We only report errors if they happened for the topic of
+			// the connection, otherwise the topic will simply have no
+			// partitions in the result set.
+			return nil, Error(t.TopicErrorCode)
+		}
+		for _, p := range t.Partitions {
+			partitions = append(partitions, Partition{
+				Topic:           t.TopicName,
+				Leader:          brokers[p.Leader],
+				Replicas:        makeBrokers(brokers, p.Replicas...),
+				Isr:             makeBrokers(brokers, p.Isr...),
+				ID:              int(p.PartitionID),
+				OfflineReplicas: makeBrokers(brokers, p.OfflineReplicas...),
+			})
+		}
+	}
+	return
+}
+
+func makeBrokers(brokers map[int32]Broker, ids ...int32) []Broker {
+	b := make([]Broker, len(ids))
+	for i, id := range ids {
+		br, ok := brokers[id]
+		if !ok {
+			// When the broker id isn't found in the current list of known
+			// brokers, use a placeholder to report that the cluster has
+			// logical knowledge of the broker but no information about the
+			// physical host where it is running.
+			br.ID = int(id)
+		}
+		b[i] = br
+	}
+	return b
 }
 
 // Write writes a message to the kafka broker that this connection was
@@ -1107,11 +1132,10 @@ func (c *Conn) writeCompressedMessages(codec CompressionCodec, msgs ...Message) 
 			deadline = adjustDeadlineForRTT(deadline, now, defaultRTT)
 			switch produceVersion {
 			case v7:
-				recordBatch, err :=
-					newRecordBatch(
-						codec,
-						msgs...,
-					)
+				recordBatch, err := newRecordBatch(
+					codec,
+					msgs...,
+				)
 				if err != nil {
 					return err
 				}
@@ -1126,11 +1150,10 @@ func (c *Conn) writeCompressedMessages(codec CompressionCodec, msgs ...Message) 
 					recordBatch,
 				)
 			case v3:
-				recordBatch, err :=
-					newRecordBatch(
-						codec,
-						msgs...,
-					)
+				recordBatch, err := newRecordBatch(
+					codec,
+					msgs...,
+				)
 				if err != nil {
 					return err
 				}
@@ -1195,7 +1218,6 @@ func (c *Conn) writeCompressedMessages(codec CompressionCodec, msgs ...Message) 
 						}
 						return size, err
 					}
-
 				})
 				if err != nil {
 					return size, err
@@ -1227,12 +1249,6 @@ func (c *Conn) SetRequiredAcks(n int) error {
 	}
 }
 
-func (c *Conn) writeRequestHeader(apiKey apiKey, apiVersion apiVersion, correlationID int32, size int32) {
-	hdr := c.requestHeader(apiKey, apiVersion, correlationID)
-	hdr.Size = (hdr.size() + size) - 4
-	hdr.writeTo(&c.wb)
-}
-
 func (c *Conn) writeRequest(apiKey apiKey, apiVersion apiVersion, correlationID int32, req request) error {
 	hdr := c.requestHeader(apiKey, apiVersion, correlationID)
 	hdr.Size = (hdr.size() + req.size()) - 4
@@ -1243,11 +1259,10 @@ func (c *Conn) writeRequest(apiKey apiKey, apiVersion apiVersion, correlationID 
 
 func (c *Conn) readResponse(size int, res interface{}) error {
 	size, err := read(&c.rbuf, size, res)
-	switch err.(type) {
-	case Error:
-		var e error
-		if size, e = discardN(&c.rbuf, size, size); e != nil {
-			err = e
+	if err != nil {
+		var kafkaError Error
+		if errors.As(err, &kafkaError) {
+			size, err = discardN(&c.rbuf, size, size)
 		}
 	}
 	return expectZeroSize(size, err)
@@ -1306,9 +1321,8 @@ func (c *Conn) do(d *connDeadline, write func(time.Time, int32) error, read func
 	}
 
 	if err = read(deadline, size); err != nil {
-		switch err.(type) {
-		case Error:
-		default:
+		var kafkaError Error
+		if !errors.As(err, &kafkaError) {
 			c.conn.Close()
 		}
 	}
@@ -1563,7 +1577,7 @@ func (c *Conn) saslAuthenticate(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	if version == v1 {
-		var request = saslAuthenticateRequestV0{Data: data}
+		request := saslAuthenticateRequestV0{Data: data}
 		var response saslAuthenticateResponseV0
 
 		err := c.writeOperation(
