@@ -30,11 +30,12 @@ const (
 	DefaultSubBatchSize          = 1000
 	DefaultMaxPublishRetries     = 3
 	DefaultPublishRetryInterval  = time.Second * 3
+	DefaultRequiredWriteAcks     = kafka.RequireNone
 )
 
 var (
 	ErrMissingUsername = errors.New("missing username for SASL authentication")
-	ErrMissingPassword = errors.New("missing passwird for SASL authentication")
+	ErrMissingPassword = errors.New("missing password for SASL authentication")
 )
 
 type IKafka interface {
@@ -126,6 +127,10 @@ type Options struct {
 	// and is used to trigger shutdown of APIs and then main()
 	MainShutdownFunc context.CancelFunc
 
+	// The level of required acknowledgements to ask the kafka broker for.
+	// More acks == more reliable but slower. Default: None
+	RequiredWriteAcks kafka.RequiredAcks
+
 	EnableKafkaGoLogs bool
 }
 
@@ -187,9 +192,10 @@ func New(opts *Options) (*Kafka, error) {
 
 	k := &Kafka{
 		Writer: &kafka.Writer{
-			Addr:      kafka.TCP(opts.Brokers...),
-			BatchSize: opts.BatchSize,
-			Transport: transport,
+			Addr:         kafka.TCP(opts.Brokers...),
+			BatchSize:    opts.BatchSize,
+			Transport:    transport,
+			RequiredAcks: opts.RequiredWriteAcks,
 		},
 		Dialer:                 dialer,
 		PublisherMutex:         &sync.RWMutex{},
@@ -435,6 +441,10 @@ func validateOptions(opts *Options) error {
 		opts.ReaderMaxWait = DefaultReaderMaxWait
 	}
 
+	if opts.RequiredWriteAcks == 0 {
+		opts.RequiredWriteAcks = DefaultRequiredWriteAcks
+	}
+
 	if opts.ServiceShutdownContext == nil {
 		return errors.New("ServiceShutdownContext cannot be nil")
 	}
@@ -562,7 +572,7 @@ func (p *Publisher) runBatchPublisher(ctx context.Context) {
 
 		// This MUST be context.Background() otherwise the last batch of messages will fail to write since the
 		// publisher context has been cancelled.
-		p.WriteMessagesBatch(context.Background(), tmpQueue)
+		_ = p.WriteMessagesBatch(context.Background(), tmpQueue)
 
 		return nil
 	})
