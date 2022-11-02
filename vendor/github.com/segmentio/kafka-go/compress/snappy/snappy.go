@@ -4,7 +4,6 @@ import (
 	"io"
 	"sync"
 
-	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/snappy"
 )
 
@@ -15,16 +14,6 @@ type Framing int
 const (
 	Framed Framing = iota
 	Unframed
-)
-
-// Compression level.
-type Compression int
-
-const (
-	DefaultCompression Compression = iota
-	FasterCompression
-	BetterCompression
-	BestCompression
 )
 
 var (
@@ -39,9 +28,6 @@ type Codec struct {
 	//
 	// Default to Framed.
 	Framing Framing
-
-	// Compression level.
-	Compression Compression
 }
 
 // Code implements the compress.Codec interface.
@@ -70,19 +56,12 @@ func (c *Codec) NewWriter(w io.Writer) io.WriteCloser {
 	if x != nil {
 		x.Reset(w)
 	} else {
-		x = &xerialWriter{writer: w}
+		x = &xerialWriter{
+			writer: w,
+			encode: snappy.Encode,
+		}
 	}
 	x.framed = c.Framing == Framed
-	switch c.Compression {
-	case FasterCompression:
-		x.encode = s2.EncodeSnappy
-	case BetterCompression:
-		x.encode = s2.EncodeSnappyBetter
-	case BestCompression:
-		x.encode = s2.EncodeSnappyBest
-	default:
-		x.encode = snappy.Encode // aka. s2.EncodeSnappyBetter
-	}
 	return &writer{xerialWriter: x}
 }
 

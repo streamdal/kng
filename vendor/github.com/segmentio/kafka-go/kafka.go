@@ -47,9 +47,6 @@ type Partition struct {
 	Replicas []Broker
 	Isr      []Broker
 
-	// Available only with metadata API level >= 6:
-	OfflineReplicas []Broker
-
 	// An error that may have occurred while attempting to read the partition
 	// metadata.
 	//
