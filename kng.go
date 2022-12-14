@@ -45,7 +45,8 @@ type IKafka interface {
 	DeleteTopic(ctx context.Context, topic string) error
 	CreateTopic(ctx context.Context, topic string) error
 	GetNextOffset(ctx context.Context, topic, consumerGroup string) (int64, error)
-	NewConsumerGroup(ctx context.Context, topic, consumerName string, startOffset int64) error
+	CreateConsumerGroup(ctx context.Context, topic, consumerName string, startOffset int64) error
+	DeleteConsumerGroup(ctx context.Context, consumerName string) error
 }
 
 type IReader interface {
@@ -348,8 +349,8 @@ func (k *Kafka) GetNextOffset(ctx context.Context, topic, consumerGroup string) 
 	return nextOffset, nil
 }
 
-func (k *Kafka) NewConsumerGroup(ctx context.Context, topic, consumerName string, startOffset int64) error {
-	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.NewConsumerGroup")
+func (k *Kafka) CreateConsumerGroup(ctx context.Context, topic, consumerName string, startOffset int64) error {
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.CreateConsumerGroup")
 	defer span.Finish()
 
 	// TODO: figure these options out
@@ -436,6 +437,26 @@ func (k *Kafka) sanityCheckPartitions(clusterAdmin sarama.ClusterAdmin) error {
 	}
 
 	k.initialBrokerCheck = true
+
+	return nil
+}
+
+func (k *Kafka) DeleteConsumerGroup(ctx context.Context, consumerName string) error {
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.DeleteConsumerGroup")
+	defer span.Finish()
+
+	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, k.getSaramaConfig())
+	if err != nil {
+		err = errors.Wrap(err, "could not open new connection to kafka")
+		span.SetTag("error", err)
+		return err
+	}
+
+	if err := clusterAdmin.DeleteConsumerGroup(consumerName); err != nil {
+		err = errors.Wrapf(err, "unable to delete consumer group '%s'", consumerName)
+		span.SetTag("error", err)
+		return err
+	}
 
 	return nil
 }
