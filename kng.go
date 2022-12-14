@@ -44,6 +44,7 @@ type IKafka interface {
 	DeletePublisher(ctx context.Context, topic string) bool
 	DeleteTopic(ctx context.Context, topic string) error
 	CreateTopic(ctx context.Context, topic string) error
+	GetNextOffset(ctx context.Context, topic, consumerGroup string) (int64, error)
 }
 
 type IReader interface {
@@ -266,15 +267,15 @@ func (k *Kafka) NewReader(id, groupID, topic string) *Reader {
 
 // Publish provides a simple interface for performing batch writes to Kafka.
 //
-// * It will automatically create a dedicated publisher for the given topic IF
-//   a publisher does not already exist.
-// * It will start a background publisher in a goroutine that will clear its
-//   queue on an interval defined by PublishInterval const.
-// * The publisher goroutine will be stopped if it is idle for longer than
-//   WorkerIdleTimeout.
-// * To avoid kafka from rejecting a batch containing too many messages, the
-//   publisher will automatically divide the batch into "sub-batches" (whose
-//   size is defined by DefaultSubBatchSize.
+//   - It will automatically create a dedicated publisher for the given topic IF
+//     a publisher does not already exist.
+//   - It will start a background publisher in a goroutine that will clear its
+//     queue on an interval defined by PublishInterval const.
+//   - The publisher goroutine will be stopped if it is idle for longer than
+//     WorkerIdleTimeout.
+//   - To avoid kafka from rejecting a batch containing too many messages, the
+//     publisher will automatically divide the batch into "sub-batches" (whose
+//     size is defined by DefaultSubBatchSize.
 //
 // NOTE: The internal queue for the publisher is unbounded which means that the
 // longer the flush interval, the more memory the collector will consume.
@@ -307,6 +308,43 @@ func (k *Kafka) getSaramaConfig() *sarama.Config {
 	}
 
 	return cfg
+}
+
+func (k *Kafka) GetNextOffset(ctx context.Context, topic, consumerGroup string) (int64, error) {
+	span, ctx := tracer.StartSpanFromContext(context.Background(), "kafka.GetNextOffset")
+	defer span.Finish()
+
+	c, err := sarama.NewClient(k.Options.Brokers, k.getSaramaConfig())
+	if err != nil {
+		return 0, errors.Wrap(err, "unable to create kafka client")
+	}
+
+	om, err := sarama.NewOffsetManagerFromClient(consumerGroup, c)
+	if err != nil {
+		return 0, errors.Wrap(err, "unable to create offset manager client")
+	}
+
+	partitions, err := c.Partitions(topic)
+	if err != nil {
+		return 0, errors.Wrap(err, "unable to list partitions")
+	}
+
+	var nextOffset int64 = 0
+
+	for _, partition := range partitions {
+		p, err := om.ManagePartition(topic, partition)
+		if err != nil {
+			return 0, errors.Wrap(err, "unable to get partition manager")
+		}
+
+		res, _ := p.NextOffset()
+
+		if res > nextOffset {
+			nextOffset = res
+		}
+	}
+
+	return nextOffset, nil
 }
 
 func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
