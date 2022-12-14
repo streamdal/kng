@@ -45,6 +45,7 @@ type IKafka interface {
 	DeleteTopic(ctx context.Context, topic string) error
 	CreateTopic(ctx context.Context, topic string) error
 	GetNextOffset(ctx context.Context, topic, consumerGroup string) (int64, error)
+	NewConsumerGroup(ctx context.Context, topic, consumerName string, startOffset int64) error
 }
 
 type IReader interface {
@@ -311,7 +312,7 @@ func (k *Kafka) getSaramaConfig() *sarama.Config {
 }
 
 func (k *Kafka) GetNextOffset(ctx context.Context, topic, consumerGroup string) (int64, error) {
-	span, ctx := tracer.StartSpanFromContext(context.Background(), "kafka.GetNextOffset")
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.GetNextOffset")
 	defer span.Finish()
 
 	c, err := sarama.NewClient(k.Options.Brokers, k.getSaramaConfig())
@@ -347,8 +348,45 @@ func (k *Kafka) GetNextOffset(ctx context.Context, topic, consumerGroup string) 
 	return nextOffset, nil
 }
 
+func (k *Kafka) NewConsumerGroup(ctx context.Context, topic, consumerName string, startOffset int64) error {
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.NewConsumerGroup")
+	defer span.Finish()
+
+	// TODO: figure these options out
+	cfg := kafka.ConsumerGroupConfig{
+		ID:                    consumerName,
+		Brokers:               k.Options.Brokers,
+		Dialer:                k.Dialer,
+		Topics:                []string{topic},
+		WatchPartitionChanges: true,
+		GroupBalancers:        nil,
+		RetentionTime:         -1,
+		StartOffset:           startOffset,
+		Timeout:               time.Second * 10,
+		//SessionTimeout:         0,
+		//RebalanceTimeout:       0,
+		//JoinGroupBackoff:       0,
+		//HeartbeatInterval:      0,
+		//PartitionWatchInterval: 0,
+	}
+
+	if k.Options.EnableKafkaGoLogs {
+		cfg.Logger = kafka.LoggerFunc(k.log.Infof)
+		cfg.ErrorLogger = kafka.LoggerFunc(k.log.Errorf)
+	}
+
+	_, err := kafka.NewConsumerGroup(cfg)
+	if err != nil {
+		err = errors.Wrapf(err, "unable to create consumer group '%s' for topic '%s'", consumerName, topic)
+		span.SetTag("error", err)
+		return err
+	}
+
+	return nil
+}
+
 func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
-	span, ctx := tracer.StartSpanFromContext(context.Background(), "kafka.CreateTopic")
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.CreateTopic")
 	defer span.Finish()
 
 	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, k.getSaramaConfig())
