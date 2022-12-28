@@ -44,6 +44,12 @@ type IKafka interface {
 	DeletePublisher(ctx context.Context, topic string) bool
 	DeleteTopic(ctx context.Context, topic string) error
 	CreateTopic(ctx context.Context, topic string) error
+	GetTopicPartitions(ctx context.Context, topic string) ([]int, error)
+	GetTopicOffsets(ctx context.Context, topic string) ([]kafka.PartitionOffsets, error)
+	CreateConsumerGroup(ctx context.Context, topic, cg string) (*kafka.ConsumerGroup, error)
+	DeleteConsumerGroup(ctx context.Context, cg string) error
+	GetConsumerGroupOffsets(ctx context.Context, topic, cg string) (map[int]int64, error)
+	SetConsumerGroupOffsets(ctx context.Context, topic, cg string, offsets map[int]int64) error
 }
 
 type IReader interface {
@@ -51,11 +57,15 @@ type IReader interface {
 }
 
 type Kafka struct {
-	Dialer             *kafka.Dialer
-	Writer             *kafka.Writer
-	PublisherMap       map[string]*Publisher
-	PublisherMutex     *sync.RWMutex
-	Options            *Options
+	Dialer         *kafka.Dialer
+	Writer         *kafka.Writer
+	PublisherMap   map[string]*Publisher
+	PublisherMutex *sync.RWMutex
+	Options        *Options
+
+	conn   *kafka.Conn
+	client *kafka.Client
+
 	initialBrokerCheck bool
 	log                *logrus.Entry
 
@@ -176,7 +186,7 @@ func New(opts *Options) (*Kafka, error) {
 
 	ctxWithTimeout, _ := context.WithTimeout(context.Background(), opts.Timeout)
 
-	_, err := dialKafka(ctxWithTimeout, dialer, opts.Brokers)
+	conn, err := dialKafka(ctxWithTimeout, dialer, opts.Brokers)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create initial connection to broker(s): %s", err)
 	}
@@ -203,7 +213,13 @@ func New(opts *Options) (*Kafka, error) {
 		Options:                opts,
 		ServiceShutdownContext: opts.ServiceShutdownContext,
 		MainShutdownFunc:       opts.MainShutdownFunc,
-		log:                    llog,
+		conn:                   conn,
+		client: &kafka.Client{
+			Addr:      kafka.TCP(opts.Brokers...),
+			Timeout:   DefaultConnectTimeout,
+			Transport: transport,
+		},
+		log: llog,
 	}
 
 	if k.Options.EnableKafkaGoLogs {
@@ -285,30 +301,132 @@ func (k *Kafka) Publish(ctx context.Context, topic string, value []byte) {
 	k.getPublisherByTopic(topic).batch(ctx, value)
 }
 
-func (k *Kafka) getSaramaConfig() *sarama.Config {
-	cfg := sarama.NewConfig()
+// GetTopicPartitions will get the partitions that a topic uses. It will NOT
+// include offset information - use GetTopicOffsets() instead.
+func (k *Kafka) GetTopicPartitions(ctx context.Context, topic string) ([]int, error) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.GetTopicPartitions")
+	defer span.Finish()
 
-	if k.Options.UseTLS {
-		cfg.Net.TLS.Enable = true
-		cfg.Net.TLS.Config = &tls.Config{
-			InsecureSkipVerify: true,
-		}
+	partitions, err := k.conn.ReadPartitions(topic)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to read partitions for topic '%s'", topic)
 	}
 
-	if k.Options.SaslType != "" {
-		cfg.Net.SASL.Enable = true
-		cfg.Net.SASL.User = k.Options.Username
-		cfg.Net.SASL.Password = k.Options.Password
-		if k.Options.SaslType == "scram" {
-			cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
-		} else {
-			cfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
-		}
+	if len(partitions) == 0 {
+		return nil, fmt.Errorf("no partitions found for topic '%s'", topic)
 	}
 
-	return cfg
+	plist := make([]int, 0)
+
+	for _, p := range partitions {
+		if p.Error != nil {
+			return nil, errors.Wrap(err, "partition lookup error")
+		}
+
+		plist = append(plist, p.ID)
+	}
+
+	return plist, nil
 }
 
+// GetTopicOffsets will figure out the max offsets across all partitions in a
+// given topic. This is used for validating that a given topic _has_ the offsets
+// that are requested via SetConsumerGroupOffsets (or just ensuring that the
+// topic contains the expected amount of messages/data).
+func (k *Kafka) GetTopicOffsets(ctx context.Context, topic string) ([]kafka.PartitionOffsets, error) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.GetTopicOffsets")
+	defer span.Finish()
+
+	partitions, err := k.GetTopicPartitions(ctx, topic)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to get partitions for topic '%s'", topic)
+	}
+
+	offsetRequests := make([]kafka.OffsetRequest, 0)
+
+	for _, p := range partitions {
+		offsetRequests = append(offsetRequests, kafka.LastOffsetOf(p))
+
+	}
+
+	listOffsetsReq := &kafka.ListOffsetsRequest{
+		Addr: k.client.Addr,
+		Topics: map[string][]kafka.OffsetRequest{
+			topic: offsetRequests,
+		},
+	}
+
+	resp, err := k.client.ListOffsets(ctx, listOffsetsReq)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to complete ListOffsets request")
+	}
+
+	if _, ok := resp.Topics[topic]; !ok {
+		return nil, errors.New("response does not contain requested topic")
+	}
+
+	return resp.Topics[topic], nil
+}
+
+// CreateConsumerGroup will instantiate a new consumer group for the given topic.
+// NOTE: The consumer group is created asynchronously by the Segment library so
+// it may not be available immediately after method exit.
+func (k *Kafka) CreateConsumerGroup(ctx context.Context, topic, cg string) (*kafka.ConsumerGroup, error) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.CreateConsumerGroup")
+	defer span.Finish()
+
+	cfg := kafka.ConsumerGroupConfig{
+		ID:                    cg,
+		Brokers:               k.Options.Brokers,
+		Dialer:                k.Dialer,
+		Topics:                []string{topic},
+		WatchPartitionChanges: true,
+		RetentionTime:         -1 * time.Millisecond, // use kafka's defaults
+		StartOffset:           kafka.FirstOffset,
+		Timeout:               time.Second * 10,
+	}
+
+	if k.Options.EnableKafkaGoLogs {
+		cfg.Logger = kafka.LoggerFunc(k.log.Infof)
+		cfg.ErrorLogger = kafka.LoggerFunc(k.log.Errorf)
+	}
+
+	group, err := kafka.NewConsumerGroup(cfg)
+	if err != nil {
+		err = errors.Wrapf(err, "unable to create consumer group '%s' for topic '%s'", cg, topic)
+		span.SetTag("error", err)
+		return nil, err
+	}
+
+	return group, nil
+}
+
+// DeleteConsumerGroup will delete a given consumer group. The method will error
+// if the consumer group does not exist or if there are active consumers.
+// To avoid active consumer errors, make sure to Close() on consumers and wait
+// a second or two for Kafka brokers to pick up the consumer update.
+func (k *Kafka) DeleteConsumerGroup(ctx context.Context, cg string) error {
+	span, ctx := tracer.StartSpanFromContext(ctx, "kafka.DeleteConsumerGroup")
+	defer span.Finish()
+
+	clusterAdmin, err := sarama.NewClusterAdmin(k.Options.Brokers, k.getSaramaConfig())
+	if err != nil {
+		err = errors.Wrap(err, "could not open new admin connection to kafka")
+		span.SetTag("error", err)
+		return err
+	}
+
+	if err := clusterAdmin.DeleteConsumerGroup(cg); err != nil {
+		err = errors.Wrapf(err, "unable to delete consumer group '%s'", cg)
+		span.SetTag("error", err)
+		return err
+	}
+
+	return nil
+}
+
+// CreateTopic will create the requested topic. Wait for 1-3 seconds after create
+// before using the new topic to give Kafka enough time to prep.
 func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 	span, ctx := tracer.StartSpanFromContext(context.Background(), "kafka.CreateTopic")
 	defer span.Finish()
@@ -335,31 +453,6 @@ func (k *Kafka) CreateTopic(ctx context.Context, topic string) error {
 		span.SetTag("error", err)
 		return err
 	}
-
-	return nil
-}
-
-// sanityCheckPartitions overrides replica and partition configs when running with only one broker, aka local docker
-func (k *Kafka) sanityCheckPartitions(clusterAdmin sarama.ClusterAdmin) error {
-	// Only perform this check once in attempt to avoid "Request exceeded the user-specified time limit in the request"
-	// error when creating a large amount of topics at once. This error is caused by frequent metadata requests slowing
-	// things down.
-	if k.initialBrokerCheck {
-		return nil
-	}
-
-	brokers, _, err := clusterAdmin.DescribeCluster()
-	if err != nil {
-		return errors.Wrap(err, "could not get broker list")
-	}
-
-	// If local, we do not want to overload kafka - use sensible settings
-	if len(brokers) == 1 {
-		k.Options.ReplicationFactor = 1
-		k.Options.NumPartitionsPerTopic = 1
-	}
-
-	k.initialBrokerCheck = true
 
 	return nil
 }
@@ -418,6 +511,152 @@ func (k *Kafka) DeletePublisher(ctx context.Context, topic string) bool {
 	k.PublisherMutex.Unlock()
 
 	return true
+}
+
+// GetConsumerGroupOffsets gets the MAX offsets per partition in topic.
+// Map key == partition, value == offset.
+func (k *Kafka) GetConsumerGroupOffsets(ctx context.Context, topic, cg string) (map[int]int64, error) {
+	span, _ := tracer.StartSpanFromContext(ctx, "kafka.GetConsumerGroupOffsets")
+	defer span.Finish()
+
+	c, err := sarama.NewClient(k.Options.Brokers, k.getSaramaConfig())
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to create kafka client")
+	}
+
+	om, err := sarama.NewOffsetManagerFromClient(cg, c)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to create offset manager client")
+	}
+
+	partitions, err := c.Partitions(topic)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to list partitions")
+	}
+
+	offsets := make(map[int]int64)
+
+	for _, partition := range partitions {
+		p, err := om.ManagePartition(topic, partition)
+		if err != nil {
+			return nil, errors.Wrapf(err, "unable to create partition manager for partition '%d'", partition)
+		}
+
+		nextOffset, _ := p.NextOffset()
+		offsets[int(partition)] = nextOffset
+	}
+
+	return offsets, nil
+}
+
+// SetConsumerGroupOffsets sets the offsets for the given topic + consumer group
+func (k *Kafka) SetConsumerGroupOffsets(ctx context.Context, topic, cg string, offsets map[int]int64) error {
+	span, _ := tracer.StartSpanFromContext(ctx, "kafka.SetConsumerGroupOffsets")
+	defer span.Finish()
+
+	// Verify that the request is for a topic that actually contains the requested
+	// number of partitions (and has enough data to satisfy offsets)
+	existingOffsets, err := k.GetTopicOffsets(ctx, topic)
+	if err != nil {
+		return errors.Wrap(err, "unable to fetch topic offsets")
+	}
+
+	// The requested offsets and existing partition + offset data should contain
+	// the same number of elements (partitions)
+	if len(existingOffsets) != len(offsets) {
+		return errors.New("partition mismatch between requested and existing partitions")
+	}
+
+	// Verify that requested offsets include all of the necessary partition & offsets
+	for _, p := range existingOffsets {
+		// Does the req contain offset info for this partition?
+		if _, ok := offsets[p.Partition]; !ok {
+			return fmt.Errorf("request missing partition '%d'", p.Partition)
+		}
+
+		// Does the offset exceed the number of messages we actually have?
+		if offsets[p.Partition] > p.LastOffset {
+			return fmt.Errorf("requested offset '%d' does not exist in target partition '%d' "+
+				"(max offset in target partition: %d)", offsets[p.Partition], p.Partition, p.LastOffset)
+		}
+	}
+
+	// Validation complete; ready to set offsets
+
+	// NOTE: This was the only way I was able to make setting offsets work.
+	// sarama's ResetOffset() via offset manager did not work (and actually
+	// caused kafka CLI scripts to break at one point). ~DS 12.20.2022
+	group, err := k.CreateConsumerGroup(ctx, topic, cg)
+	if err != nil {
+		return errors.Wrap(err, "unable to create consumer group")
+	}
+
+	gen, err := group.Next(context.Background())
+	if err != nil {
+		return errors.Wrap(err, "unable to get next generator")
+	}
+
+	err = gen.CommitOffsets(map[string]map[int]int64{
+		topic: offsets,
+	})
+
+	if err != nil {
+		return errors.Wrap(err, "unable to commit offsets")
+	}
+
+	return nil
+}
+
+// Convenience method for generating a sarama config. Note: we are forcing the
+// specific version so that we have access to new features in the Kafka API.
+func (k *Kafka) getSaramaConfig() *sarama.Config {
+	cfg := sarama.NewConfig()
+	cfg.Version = sarama.V2_6_0_0 // Need this in order for offset bits to work
+
+	if k.Options.UseTLS {
+		cfg.Net.TLS.Enable = true
+		cfg.Net.TLS.Config = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
+	if k.Options.SaslType != "" {
+		cfg.Net.SASL.Enable = true
+		cfg.Net.SASL.User = k.Options.Username
+		cfg.Net.SASL.Password = k.Options.Password
+		if k.Options.SaslType == "scram" {
+			cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+		} else {
+			cfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+		}
+	}
+
+	return cfg
+}
+
+// sanityCheckPartitions overrides replica and partition configs when running with only one broker, aka local docker
+func (k *Kafka) sanityCheckPartitions(clusterAdmin sarama.ClusterAdmin) error {
+	// Only perform this check once in attempt to avoid "Request exceeded the user-specified time limit in the request"
+	// error when creating a large amount of topics at once. This error is caused by frequent metadata requests slowing
+	// things down.
+	if k.initialBrokerCheck {
+		return nil
+	}
+
+	brokers, _, err := clusterAdmin.DescribeCluster()
+	if err != nil {
+		return errors.Wrap(err, "could not get broker list")
+	}
+
+	// If local, we do not want to overload kafka - use sensible settings
+	if len(brokers) == 1 {
+		k.Options.ReplicationFactor = 1
+		k.Options.NumPartitionsPerTopic = 1
+	}
+
+	k.initialBrokerCheck = true
+
+	return nil
 }
 
 func validateOptions(opts *Options) error {
